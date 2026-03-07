@@ -20,6 +20,7 @@
 #include "gui/render_view.h"
 #include "gui/hotkey.h"
 #include "gui/keyaccel.h"
+#include "gui/dragkey.h"
 #include "gui/api_gui.h"
 #include "gui/widget_dopesheet.h"
 #include "gui/widget_draw.h"
@@ -39,6 +40,7 @@
 
 
 static dt_keyaccel_t keyaccel;
+static dt_dragkeys_t dragkeys;
 
 enum hotkey_names_t
 { // for sane access in code
@@ -177,6 +179,8 @@ darkroom_keyboard(GLFWwindow *window, int key, int scancode, int action, int mod
     }
     return;
   }
+
+  if(dt_dragkey_keyboard(&dragkeys, key, action)) return;
 
   gui.hotkey = action == GLFW_PRESS ? hk_get_hotkey(hk_darkroom, hk_darkroom_cnt, key) : -1;
   if(action != GLFW_PRESS) return; // only handle key down events
@@ -803,12 +807,14 @@ void render_darkroom_init()
   gui.active_instance = 0;
   hk_darkroom_cnt = dt_keyaccel_init(&keyaccel, hk_darkroom, hk_darkroom_cnt, hk_darkroom_size);
   hk_deserialise("darkroom", hk_darkroom, hk_darkroom_cnt);
+  dt_dragkeys_init(&dragkeys);
 }
 
 void render_darkroom_cleanup()
 {
   hk_serialise("darkroom", hk_darkroom, hk_darkroom_cnt);
   dt_keyaccel_cleanup(&keyaccel);
+  dt_dragkeys_cleanup(&dragkeys);
 }
 
 void
@@ -885,6 +891,7 @@ darkroom_mouse_scrolled(GLFWwindow* window, double xoff, double yoff)
 void
 darkroom_mouse_position(GLFWwindow* window, double x, double y)
 {
+  if(dt_dragkey_mouse_move(&dragkeys, x)) return;
   if(!vkdt.wstate.grabbed && (vkdt.graph_dev.active_module >= 0))
   { // pass on mouse events on dspy window
     dt_module_t *mod = vkdt.graph_dev.module + vkdt.graph_dev.active_module;
