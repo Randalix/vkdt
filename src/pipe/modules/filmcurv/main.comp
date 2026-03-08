@@ -16,6 +16,7 @@ layout(std140, set = 0, binding = 1) uniform params_t
   float contrast;
   float bias;
   int   colourmode;
+  float chroma;
 } params;
 
 layout(set = 1, binding = 0) uniform sampler2D img_in;
@@ -144,6 +145,24 @@ main()
   else if (params.colourmode == 4)
   { // agx tone mapping
     col1 = agx(col0, il, k);
+  }
+
+  // chroma preservation: compensate tone curve's saturation loss.
+  // highlights: use curve derivative to boost where slope < 1 (compression zone).
+  // shadows: smoothstep-based boost compensating for hunt effect.
+  // single 'chroma' parameter drives both, 0=off, 1=moderate, 2=strong.
+  if(params.chroma != 0.0)
+  {
+    const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
+    float lum0 = max(dot(col0, lw), 1e-7);
+    float lum1 = max(dot(col1, lw), 1e-7);
+    // highlight compensation: where curve slope < 1, boost by 1/slope
+    float deriv = weibull_pdf(lum0, il, k);
+    float hi = pow(max(1.0, 1.0 / max(deriv, 0.15)), params.chroma * 0.1);
+    // shadow compensation: hunt effect, boost chroma in dark tones
+    float sw = smoothstep(0.3, 0.0, lum1);
+    float lo = 1.0 + params.chroma * 0.15 * sw;
+    col1 = mix(vec3(lum1), col1, hi * lo);
   }
 
   if(all(lessThan(ipos, imageSize(img_crv))))
