@@ -1,0 +1,68 @@
+#version 460
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "shared.glsl"
+
+layout(local_size_x = DT_LOCAL_SIZE_X, local_size_y = DT_LOCAL_SIZE_Y, local_size_z = 1) in;
+layout(set = 1, binding = 0, r32ui) uniform uimage2D img_lut;
+layout(set = 1, binding = 1) uniform writeonly image2D img_out;
+
+#define LUT_N 17
+
+vec4 load_cell(ivec3 ci)
+{
+  ci = clamp(ci, ivec3(0), ivec3(LUT_N - 1));
+  int px = ci.x + ci.z * LUT_N;
+  float r = uintBitsToFloat(imageLoad(img_lut, ivec2(px, ci.y * 4 + 0)).r);
+  float g = uintBitsToFloat(imageLoad(img_lut, ivec2(px, ci.y * 4 + 1)).r);
+  float b = uintBitsToFloat(imageLoad(img_lut, ivec2(px, ci.y * 4 + 2)).r);
+  float w = uintBitsToFloat(imageLoad(img_lut, ivec2(px, ci.y * 4 + 3)).r);
+  return vec4(r, g, b, w);
+}
+
+void main()
+{
+  // dispatch as LUT_N * LUT_N x LUT_N
+  ivec2 opos = ivec2(gl_GlobalInvocationID);
+  if(any(greaterThanEqual(opos, imageSize(img_out)))) return;
+
+  // decode 2D pos back to 3D LUT cell
+  int ri = opos.x % LUT_N;
+  int bi = opos.x / LUT_N;
+  int gi = opos.y;
+  ivec3 ci = ivec3(ri, gi, bi);
+
+  vec4 cell = load_cell(ci);
+
+  vec3 result;
+  if(cell.w > 0.0)
+  {
+    result = cell.rgb / cell.w;
+  }
+  else
+  {
+    // empty cell: use identity mapping (input color = output color)
+    // try to find nearest populated cell by searching neighbors
+    vec3 acc = vec3(0);
+    float wacc = 0.0;
+    for(int dz = -2; dz <= 2; dz++)
+    for(int dy = -2; dy <= 2; dy++)
+    for(int dx = -2; dx <= 2; dx++)
+    {
+      vec4 n = load_cell(ci + ivec3(dx, dy, dz));
+      if(n.w > 0.0)
+      {
+        float d = 1.0 / (1.0 + float(dx*dx + dy*dy + dz*dz));
+        acc += (n.rgb / n.w) * d;
+        wacc += d;
+      }
+    }
+    if(wacc > 0.0)
+      result = acc / wacc;
+    else // fallback: identity
+      result = vec3(ci) / float(LUT_N - 1);
+  }
+
+  imageStore(img_out, opos, vec4(result, 1));
+}

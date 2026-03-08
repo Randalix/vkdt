@@ -16,13 +16,37 @@ layout(set = 1, binding = 0) uniform sampler2D img_in;
 layout(set = 1, binding = 1) uniform sampler2D img_target;
 layout(set = 1, binding = 2) uniform writeonly image2D img_out;
 
-// sRGB OETF: linear -> display (same as colenc)
+// sRGB OETF
 vec3 srgb_oetf(vec3 c)
 {
   return mix(
     12.92 * c,
     1.055 * pow(c, vec3(1.0/2.4)) - 0.055,
     greaterThan(c, vec3(0.0031308)));
+}
+
+// sRGB EOTF
+vec3 srgb_eotf(vec3 c)
+{
+  return mix(
+    c / 12.92,
+    pow((c + 0.055) / 1.055, vec3(2.4)),
+    greaterThan(c, vec3(0.04045)));
+}
+
+// linear sRGB -> oklab
+vec3 linear_srgb_to_oklab(vec3 c)
+{
+  float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+  float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+  float s = 0.0883024619 * c.r + 0.2220049874 * c.g + 0.6996925507 * c.b;
+  l = pow(max(l, 0.0), 1.0/3.0);
+  m = pow(max(m, 0.0), 1.0/3.0);
+  s = pow(max(s, 0.0), 1.0/3.0);
+  return vec3(
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s);
 }
 
 #define LUT_N 17
@@ -41,7 +65,8 @@ void main()
 
   const mat3 rec2020_to_rec709 = matrix_rec2020_to_rec709;
 
-  vec3 acc = vec3(0);
+  // accumulate chroma delta (oklab a,b) only
+  vec2 acc_ab = vec2(0);
   float wacc = 0.0;
 
   for(int gy = 0; gy < GRID_N; gy++)
@@ -49,27 +74,38 @@ void main()
   {
     vec2 uv = (vec2(gx, gy) + 0.5) / float(GRID_N);
 
-    // convert filmcurv output to sRGB display space (simulate colenc)
+    // convert filmcurv output to sRGB display space for indexing
     vec3 src_pipeline = textureLod(img_in, uv, 0).rgb;
     vec3 src_display = srgb_oetf(clamp(rec2020_to_rec709 * src_pipeline, vec3(0), vec3(1)));
 
     vec3 diff = abs(src_display - cell_center);
     if(all(lessThan(diff, vec3(cell_radius))))
     {
-      // JPEG is already in sRGB display space — compute delta
-      vec3 tgt_display = textureLod(img_target, uv, 0).rgb;
+      // JPEG is already sRGB — linearize for oklab
+      vec3 tgt_srgb = textureLod(img_target, uv, 0).rgb;
+      vec3 tgt_linear = srgb_eotf(tgt_srgb);
+      vec3 src_linear = srgb_eotf(src_display);
+
+      // compute oklab chroma delta (a,b only, not L)
+      vec3 src_lab = linear_srgb_to_oklab(src_linear);
+      vec3 tgt_lab = linear_srgb_to_oklab(tgt_linear);
 
       float d2 = dot(diff, diff) / (cell_radius * cell_radius);
       float w = exp(-3.0 * d2);
-      acc += w * (tgt_display - src_display);
+      acc_ab += w * (tgt_lab.yz - src_lab.yz);
       wacc += w;
     }
   }
 
-  // store cell_center + delta; empty cells = cell_center (identity)
-  vec3 result = cell_center;
+  // store chroma delta in gb channels, population flag in r
+  // r = 1.0 if populated, 0.0 if empty; g = delta_a, b = delta_b
+  vec2 ab_delta = vec2(0);
+  float populated = 0.0;
   if(wacc > 0.0)
-    result += acc / wacc;
+  {
+    ab_delta = acc_ab / wacc;
+    populated = 1.0;
+  }
 
-  imageStore(img_out, opos, vec4(result, 1));
+  imageStore(img_out, opos, vec4(populated, ab_delta, 1));
 }

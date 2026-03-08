@@ -34,7 +34,38 @@ vec3 srgb_eotf(vec3 c)
     greaterThan(c, vec3(0.04045)));
 }
 
+// linear sRGB -> oklab
+vec3 linear_srgb_to_oklab(vec3 c)
+{
+  float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+  float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+  float s = 0.0883024619 * c.r + 0.2220049874 * c.g + 0.6996925507 * c.b;
+  l = pow(max(l, 0.0), 1.0/3.0);
+  m = pow(max(m, 0.0), 1.0/3.0);
+  s = pow(max(s, 0.0), 1.0/3.0);
+  return vec3(
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s);
+}
+
+// oklab -> linear sRGB
+vec3 oklab_to_linear_srgb(vec3 lab)
+{
+  float l = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+  float m = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+  float s = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+  l = l * l * l;
+  m = m * m * m;
+  s = s * s * s;
+  return vec3(
+    +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+
 // trilinear lookup in the 3D LUT stored as 2D texture
+// returns oklab chroma deltas in .gb channels
 vec3 lut_lookup(vec3 display_rgb)
 {
   vec3 sc = clamp(display_rgb, vec3(0), vec3(0.999));
@@ -55,23 +86,55 @@ vec3 lut_lookup(vec3 display_rgb)
   return acc;
 }
 
+// compute global mean chroma delta from populated LUT cells.
+// this removes the global WB bias so only relative color style corrections remain.
+// the LUT is tiny (289x17), so one thread per workgroup reads it all.
+shared vec2 global_mean_ab;
+
 void main()
 {
+  if(gl_LocalInvocationIndex == 0)
+  {
+    vec2 sum_ab = vec2(0);
+    float count = 0.0;
+    for(int y = 0; y < LUT_N; y++)
+    for(int x = 0; x < LUT_N * LUT_N; x++)
+    {
+      vec4 v = texelFetch(img_lut, ivec2(x, y), 0);
+      if(v.r > 0.5) // populated cell
+      {
+        sum_ab += v.gb;
+        count += 1.0;
+      }
+    }
+    global_mean_ab = (count > 0.0) ? sum_ab / count : vec2(0);
+  }
+  barrier();
+
   ivec2 ipos = ivec2(gl_GlobalInvocationID);
   if(any(greaterThanEqual(ipos, imageSize(img_out)))) return;
 
   vec3 rgb = texelFetch(img_in, ipos, 0).rgb;
 
-  // convert to sRGB display space (same transform as build.comp)
+  // convert to sRGB display space for LUT indexing (same transform as build.comp)
   const mat3 rec2020_to_rec709 = matrix_rec2020_to_rec709;
+  const mat3 rec709_to_rec2020 = matrix_rec709_to_rec2020;
   vec3 display = srgb_oetf(clamp(rec2020_to_rec709 * rgb, vec3(0), vec3(1)));
 
-  // LUT lookup in display space -> corrected display-space value
-  vec3 tgt_display = lut_lookup(display);
+  // LUT lookup -> chroma deltas (r=populated flag, g=delta_a, b=delta_b)
+  vec3 lut_val = lut_lookup(display);
+  vec2 ab_delta = lut_val.gb - global_mean_ab;
 
-  // blend in display space and output directly (no colenc needed)
-  vec3 result = mix(display, tgt_display, params.strength);
-  result = max(result, vec3(0.0));
+  // convert input to oklab
+  vec3 linear = srgb_eotf(display);
+  vec3 lab = linear_srgb_to_oklab(linear);
+
+  // apply relative chroma delta (a,b only), preserve luminance (L)
+  lab.yz += ab_delta * params.strength;
+
+  // convert back to linear sRGB, then to pipeline space (rec2020)
+  vec3 corrected_linear = oklab_to_linear_srgb(lab);
+  vec3 result = rec709_to_rec2020 * max(corrected_linear, vec3(0.0));
 
   imageStore(img_out, ipos, vec4(result, 1));
 }
