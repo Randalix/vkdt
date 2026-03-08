@@ -1,0 +1,75 @@
+#version 460
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "shared.glsl"
+#include "colourspaces.glsl"
+
+layout(local_size_x = DT_LOCAL_SIZE_X, local_size_y = DT_LOCAL_SIZE_Y, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 1) uniform params_t
+{
+  float strength;
+} params;
+
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1) uniform sampler2D img_target;
+layout(set = 1, binding = 2) uniform writeonly image2D img_out;
+
+// sRGB OETF: linear -> display (same as colenc)
+vec3 srgb_oetf(vec3 c)
+{
+  return mix(
+    12.92 * c,
+    1.055 * pow(c, vec3(1.0/2.4)) - 0.055,
+    greaterThan(c, vec3(0.0031308)));
+}
+
+#define LUT_N 17
+#define GRID_N 128
+
+void main()
+{
+  ivec2 opos = ivec2(gl_GlobalInvocationID);
+  if(any(greaterThanEqual(opos, imageSize(img_out)))) return;
+
+  int ri = opos.x % LUT_N;
+  int bi = opos.x / LUT_N;
+  int gi = opos.y;
+  vec3 cell_center = vec3(ri, gi, bi) / float(LUT_N - 1);
+  float cell_radius = 1.5 / float(LUT_N - 1);
+
+  const mat3 rec2020_to_rec709 = matrix_rec2020_to_rec709;
+
+  vec3 acc = vec3(0);
+  float wacc = 0.0;
+
+  for(int gy = 0; gy < GRID_N; gy++)
+  for(int gx = 0; gx < GRID_N; gx++)
+  {
+    vec2 uv = (vec2(gx, gy) + 0.5) / float(GRID_N);
+
+    // convert filmcurv output to sRGB display space (simulate colenc)
+    vec3 src_pipeline = textureLod(img_in, uv, 0).rgb;
+    vec3 src_display = srgb_oetf(clamp(rec2020_to_rec709 * src_pipeline, vec3(0), vec3(1)));
+
+    vec3 diff = abs(src_display - cell_center);
+    if(all(lessThan(diff, vec3(cell_radius))))
+    {
+      // JPEG is already in sRGB display space — compute delta
+      vec3 tgt_display = textureLod(img_target, uv, 0).rgb;
+
+      float d2 = dot(diff, diff) / (cell_radius * cell_radius);
+      float w = exp(-3.0 * d2);
+      acc += w * (tgt_display - src_display);
+      wacc += w;
+    }
+  }
+
+  // store cell_center + delta; empty cells = cell_center (identity)
+  vec3 result = cell_center;
+  if(wacc > 0.0)
+    result += acc / wacc;
+
+  imageStore(img_out, opos, vec4(result, 1));
+}
