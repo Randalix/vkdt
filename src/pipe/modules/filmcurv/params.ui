@@ -3,3 +3,4 @@ contrast:slider:0:2
 bias:slider:0:0.02
 colour:combo:darktable ucs:per channel:munsell:hsl:agx
 chroma:slider:0:2
+rolloff:slider:0:0.5

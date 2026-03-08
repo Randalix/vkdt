@@ -17,6 +17,7 @@ layout(std140, set = 0, binding = 1) uniform params_t
   float bias;
   int   colourmode;
   float chroma;
+  float rolloff;
 } params;
 
 layout(set = 1, binding = 0) uniform sampler2D img_in;
@@ -145,6 +146,16 @@ main()
   else if (params.colourmode == 4)
   { // agx tone mapping
     col1 = agx(col0, il, k);
+  }
+
+  // highlight rolloff: compress display luminance to steepen shoulder.
+  // pow(lum, 1+rolloff) pulls down mid/low values more than highlights.
+  if(params.rolloff > 0.0)
+  {
+    const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
+    float lum1 = max(dot(col1, lw), 1e-7);
+    float new_lum = pow(lum1, 1.0 + params.rolloff);
+    col1 *= new_lum / lum1;
   }
 
   // chroma preservation: compensate tone curve's saturation loss.
