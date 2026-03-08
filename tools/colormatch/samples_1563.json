@@ -1,0 +1,30 @@
+{
+  "image": "_MG_1563.CR3",
+  "note": "Woman in orange wrap + child on terrace. Embedded JPEG coords (1620x1080, rotated).",
+  "samples": [
+    {"x": 240, "y": 720, "label": "skin_bright",     "desc": "sunlit skin, bright midtone"},
+    {"x": 300, "y": 690, "label": "skin_warm",        "desc": "warm skin highlight"},
+    {"x": 720, "y": 630, "label": "skin_shadow",      "desc": "skin in partial shadow"},
+    {"x": 780, "y": 660, "label": "skin_dark",        "desc": "darker skin tone"},
+    {"x": 1260, "y": 330, "label": "skin_mid",        "desc": "midtone skin"},
+    {"x": 1290, "y": 360, "label": "skin_highlight",  "desc": "bright skin near highlight"},
+    {"x": 810, "y": 600, "label": "skin_child",       "desc": "child skin tone"},
+    {"x": 930, "y": 90,  "label": "orange_bright",    "desc": "sunlit orange/rust fabric"},
+    {"x": 870, "y": 270, "label": "orange_shadow",    "desc": "orange fabric in shadow"},
+    {"x": 630, "y": 390, "label": "orange_mid",       "desc": "orange wrap midtone"},
+    {"x": 90,  "y": 570, "label": "orange_deep",      "desc": "deep orange fold"},
+    {"x": 1350, "y": 60,  "label": "sky_blue",        "desc": "clear blue sky"},
+    {"x": 1560, "y": 240, "label": "sky_deep",        "desc": "deeper blue sky"},
+    {"x": 972, "y": 702, "label": "yellow_hat",       "desc": "child yellow hat"},
+    {"x": 900, "y": 780, "label": "yellow_brim",      "desc": "hat brim/yellow"},
+    {"x": 360, "y": 300, "label": "neutral_warm",     "desc": "warm neutral midtone"},
+    {"x": 630, "y": 150, "label": "neutral_mid",      "desc": "neutral midtone"},
+    {"x": 972, "y": 54,  "label": "white_highlight",  "desc": "near-white highlight"},
+    {"x": 648, "y": 1026,"label": "white_wall",       "desc": "sunlit wall/ground"},
+    {"x": 81,  "y": 486, "label": "shadow_deep",      "desc": "deep shadow, near black"},
+    {"x": 81,  "y": 378, "label": "shadow_mid",       "desc": "open shadow midtone"},
+    {"x": 486, "y": 270, "label": "shadow_red",       "desc": "dark red fabric in shadow"},
+    {"x": 300, "y": 150, "label": "floral_dark",      "desc": "dark floral pattern"},
+    {"x": 1290,"y": 600, "label": "terrace_neutral",  "desc": "terrace surface neutral"}
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "image": "_MG_4159.CR3",
+  "note": "Baby in pink sweater reaching into green foliage, pink flowers. Embedded JPEG coords (1620x1080, rotated).",
+  "samples": [
+    {"x": 1200, "y": 500, "label": "skin_cheek",       "desc": "baby cheek, warm midtone skin"},
+    {"x": 810,  "y": 450, "label": "skin_hand",        "desc": "baby hand, lit skin"},
+    {"x": 600,  "y": 360, "label": "skin_arm_bright",  "desc": "arm in sunlight"},
+    {"x": 570,  "y": 330, "label": "skin_arm_mid",     "desc": "arm midtone"},
+    {"x": 1200, "y": 700, "label": "skin_ear",         "desc": "ear/neck area"},
+    {"x": 1500, "y": 450, "label": "skin_shadow",      "desc": "skin in shadow side"},
+    {"x": 870,  "y": 660, "label": "pink_sweater_mid", "desc": "pink sweater midtone"},
+    {"x": 780,  "y": 720, "label": "pink_sweater_dark","desc": "pink sweater darker fold"},
+    {"x": 930,  "y": 600, "label": "pink_sweater_lit", "desc": "pink sweater lit area"},
+    {"x": 600,  "y": 780, "label": "pink_deep",        "desc": "deep pink in shadow"},
+    {"x": 390,  "y": 90,  "label": "green_bright",     "desc": "bright green bokeh"},
+    {"x": 200,  "y": 400, "label": "green_dark",       "desc": "dark green foliage"},
+    {"x": 90,   "y": 210, "label": "green_deep",       "desc": "deep shadow green"},
+    {"x": 330,  "y": 210, "label": "green_mid",        "desc": "mid green leaves"},
+    {"x": 480,  "y": 840, "label": "green_warm",       "desc": "warm green lower area"},
+    {"x": 1410, "y": 630, "label": "flower_bright",    "desc": "pink/white flower petal"},
+    {"x": 1380, "y": 720, "label": "flower_mid",       "desc": "flower midtone"},
+    {"x": 1050, "y": 900, "label": "flower_white",     "desc": "near-white flower"},
+    {"x": 960,  "y": 960, "label": "white_highlight",  "desc": "blown highlight area"},
+    {"x": 1290, "y": 150, "label": "foliage_dark_bg",  "desc": "dark background foliage"},
+    {"x": 800,  "y": 300, "label": "shadow_deep",      "desc": "deep shadow between leaves"},
+    {"x": 1470, "y": 390, "label": "bg_neutral",       "desc": "neutral background"},
+    {"x": 480,  "y": 990, "label": "green_yellow",     "desc": "yellow-green lower bokeh"},
+    {"x": 1170, "y": 30,  "label": "warm_neutral",     "desc": "warm neutral top edge"}
+  ]
+}
