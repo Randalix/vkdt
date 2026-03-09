@@ -167,17 +167,14 @@ main()
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum0 = max(dot(col0, lw), 1e-7);
     float lum1 = weibull_cdf(lum0, il, k);
-    // highlight rolloff: compress display luminance above knee point.
-    // pow on normalised highlight range gives strong shoulder without affecting midtones.
-    if(params.rolloff > 0.0)
+    // highlight rolloff: soft-clamp display luminance above shoulder.
+    // reinhard-style x/(1+x*s): smooth, derivative-continuous at threshold,
+    // compression increases toward the top. threshold 0.5 catches highlights
+    // before they clip in the sRGB encoding stage.
+    if(params.rolloff > 0.0 && lum1 > 0.5)
     {
-      const float knee = 0.5;
-      if(lum1 > knee)
-      {
-        float x = (lum1 - knee) / (1.0 - knee); // normalise [knee, 1] to [0, 1]
-        x = pow(x, 1.0 + params.rolloff * 3.0);  // compress highlights
-        lum1 = knee + x * (1.0 - knee);           // remap back
-      }
+      float x = lum1 - 0.5;
+      lum1 = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
     }
     float L1 = L0 * pow(lum1 / lum0, 1.0/3.0);
     // chroma from per-channel curve: natural hue-dependent desaturation.
@@ -205,9 +202,8 @@ main()
       float y = weibull_cdf(x, il, k);
       if(params.rolloff > 0.0 && y > 0.5)
       {
-        float nx = (y - 0.5) / 0.5;
-        nx = pow(nx, 1.0 + params.rolloff * 3.0);
-        y = 0.5 + nx * 0.5;
+        float nx = y - 0.5;
+        y = 0.5 + nx / (1.0 + nx * params.rolloff * 4.0);
       }
       float ddx = weibull_pdf(x, il, k);
       const float w = 2.0;
@@ -219,18 +215,15 @@ main()
     return;
   }
 
-  // highlight rolloff: compress display luminance above knee point.
-  // only affects highlights, leaving shadows and midtones untouched.
+  // highlight rolloff: soft-clamp display luminance above shoulder.
   if(params.rolloff > 0.0)
   {
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
-    const float knee = 0.5;
     float lum1 = max(dot(col1, lw), 1e-7);
-    if(lum1 > knee)
+    if(lum1 > 0.5)
     {
-      float x = (lum1 - knee) / (1.0 - knee);
-      x = pow(x, 1.0 + params.rolloff * 3.0);
-      float new_lum = knee + x * (1.0 - knee);
+      float x = lum1 - 0.5;
+      float new_lum = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
       col1 *= new_lum / lum1;
     }
   }
