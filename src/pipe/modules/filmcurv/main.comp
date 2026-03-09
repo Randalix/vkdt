@@ -180,6 +180,10 @@ main()
     // chroma from per-channel curve: natural hue-dependent desaturation.
     vec3 lab_pc = rec2020_to_oklab(weibull_cdf(col0, il, k));
     float C1 = length(lab_pc.yz);
+    // chroma compression: per-channel curve oversaturates midtones and
+    // highlights relative to Canon. onset from shadows into midtones,
+    // strength tied to rolloff parameter.
+    C1 *= 1.0 - 0.6 * params.rolloff * smoothstep(0.1, 0.5, lum1);
     // hue: from original (no hue shift)
     float h = atan(lab0.z, lab0.y);
     // chroma: 0=mono, 1=natural per-channel desaturation, >1=boost
