@@ -167,12 +167,9 @@ main()
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum0 = max(dot(col0, lw), 1e-7);
     float lum1 = weibull_cdf(lum0, il, k);
-    // reinhard rolloff above shoulder prevents clipping in sRGB encoding
-    if(params.rolloff > 0.0 && lum1 > 0.5)
-    {
-      float x = lum1 - 0.5;
-      lum1 = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
-    }
+    // smooth highlight rolloff: C1-continuous cubic, preserves white point
+    // g(x) = x + r*x²*(1-x), g(0)=0, g(1)=1, g'(0)=1, g'(1)=1-r
+    lum1 = lum1 + params.rolloff * lum1 * lum1 * (1.0 - lum1);
     // shadow toe: independent from brightness/contrast
     if(params.shadows > 0.0)
     {
@@ -213,11 +210,7 @@ main()
       vec4 col_crv = vec4(0, 0, 0, 1);
       float x = ipos.x/float(imageSize(img_crv).x);
       float y = weibull_cdf(x, il, k);
-      if(params.rolloff > 0.0 && y > 0.5)
-      {
-        float nx = y - 0.5;
-        y = 0.5 + nx / (1.0 + nx * params.rolloff * 4.0);
-      }
+      y = y + params.rolloff * y * y * (1.0 - y);
       if(params.shadows > 0.0)
       {
         float tg = 1.0 - 0.5 * params.shadows;
@@ -234,17 +227,13 @@ main()
     return;
   }
 
-  // reinhard rolloff above shoulder prevents clipping in sRGB encoding
+  // smooth highlight rolloff: C1-continuous cubic, preserves white point
   if(params.rolloff > 0.0)
   {
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum1 = max(dot(col1, lw), 1e-7);
-    if(lum1 > 0.5)
-    {
-      float x = lum1 - 0.5;
-      float new_lum = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
-      col1 *= new_lum / lum1;
-    }
+    float new_lum = lum1 + params.rolloff * lum1 * lum1 * (1.0 - lum1);
+    col1 *= new_lum / lum1;
   }
 
   // compensate tone curve's saturation loss using curve derivative (highlights)
