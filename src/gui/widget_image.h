@@ -102,8 +102,33 @@ dt_image_events(struct nk_context *ctx, dt_image_widget_t *w, int hovered, int m
     }
     else if(widget == dt_token("crop"))
     {
+      // compute image bounds in the output (square) coordinate space,
+      // accounting for rotation (90/270 swaps effective width/height)
+      const int crop_modid = vkdt.wstate.active_widget_modid;
+      const dt_module_t *crop_mod = vkdt.graph_dev.module + crop_modid;
+      const float crop_raw_wd = crop_mod->connector[0].roi.wd;
+      const float crop_raw_ht = crop_mod->connector[0].roi.ht;
+      const float *crop_p_rot = dt_module_param_float(crop_mod, dt_module_get_param(crop_mod->so, dt_token("rotate")));
+      float crop_rot = crop_p_rot[0];
+      if(crop_rot == 1337.0f)
+      { // resolve exif orientation to rotation angle
+        uint32_t ori = crop_mod->img_param.orientation;
+        if(ori == 3)      crop_rot = 180.0f;
+        else if(ori == 8) crop_rot = 90.0f;
+        else if(ori == 6) crop_rot = 270.0f;
+        else              crop_rot = 0.0f;
+      }
+      const int crop_swapped = (crop_rot >= 45 && crop_rot < 135) || (crop_rot >= 225 && crop_rot < 315);
+      const float crop_iwd = crop_swapped ? crop_raw_ht : crop_raw_wd;
+      const float crop_iht = crop_swapped ? crop_raw_wd : crop_raw_ht;
+      const float crop_owd = MAX(crop_raw_wd, crop_raw_ht);
+      const float crop_xlo = .5f - .5f * crop_iwd / crop_owd;
+      const float crop_xhi = .5f + .5f * crop_iwd / crop_owd;
+      const float crop_ylo = .5f - .5f * crop_iht / crop_owd;
+      const float crop_yhi = .5f + .5f * crop_iht / crop_owd;
+
       float v[8] = {
-        vkdt.wstate.state[0], vkdt.wstate.state[2], vkdt.wstate.state[1], vkdt.wstate.state[2], 
+        vkdt.wstate.state[0], vkdt.wstate.state[2], vkdt.wstate.state[1], vkdt.wstate.state[2],
         vkdt.wstate.state[1], vkdt.wstate.state[3], vkdt.wstate.state[0], vkdt.wstate.state[3]
       };
       float p[8];
@@ -111,6 +136,27 @@ dt_image_events(struct nk_context *ctx, dt_image_widget_t *w, int hovered, int m
       nk_stroke_polygon(buf, p, 4, 1.0, nk_white);
       if(!nk_input_is_mouse_down(&ctx->input, NK_BUTTON_LEFT))
         vkdt.wstate.selected = -1;
+      if(vkdt.wstate.selected == 4)
+      { // click-and-drag to create new crop rectangle
+        float vv[] = {pos.x, pos.y}, n[2] = {0};
+        dt_image_from_view(&vkdt.wstate.img_widget, vv, n);
+        n[0] = CLAMP(n[0], crop_xlo, crop_xhi);
+        n[1] = CLAMP(n[1], crop_ylo, crop_yhi);
+        float ax = vkdt.wstate.state[4], ay = vkdt.wstate.state[5];
+        vkdt.wstate.state[0] = MIN(ax, n[0]);
+        vkdt.wstate.state[1] = MAX(ax, n[0]);
+        vkdt.wstate.state[2] = MIN(ay, n[1]);
+        vkdt.wstate.state[3] = MAX(ay, n[1]);
+        if(vkdt.wstate.aspect > 0.0f)
+        { // enforce aspect ratio, width is primary
+          float w = vkdt.wstate.state[1] - vkdt.wstate.state[0];
+          float h = w / vkdt.wstate.aspect;
+          if(n[1] >= ay) vkdt.wstate.state[3] = vkdt.wstate.state[2] + h;
+          else           vkdt.wstate.state[2] = vkdt.wstate.state[3] - h;
+        }
+      }
+      else
+      {
       int edge_hovered = -1;
       if(hovered)
       {
@@ -161,9 +207,24 @@ dt_image_events(struct nk_context *ctx, dt_image_widget_t *w, int hovered, int m
         }
         float v[] = {epos[0]+pos.x-cpos.x, epos[1]+pos.y-cpos.y}, n[2] = {0};
         dt_image_from_view(&vkdt.wstate.img_widget, v, n);
-        float edge = vkdt.wstate.selected < 2 ? n[0] : n[1];
+        float edge = vkdt.wstate.selected < 2 ?
+          CLAMP(n[0], crop_xlo, crop_xhi) :
+          CLAMP(n[1], crop_ylo, crop_yhi);
         dt_gui_dr_crop_adjust(edge, 0);
       }
+      else if(hovered && nk_input_is_mouse_pressed(&ctx->input, NK_BUTTON_LEFT))
+      { // click away from edges: start new crop rectangle by dragging
+        float vv[] = {pos.x, pos.y}, n[2] = {0};
+        dt_image_from_view(&vkdt.wstate.img_widget, vv, n);
+        n[0] = CLAMP(n[0], crop_xlo, crop_xhi);
+        n[1] = CLAMP(n[1], crop_ylo, crop_yhi);
+        vkdt.wstate.state[4] = n[0]; // anchor x
+        vkdt.wstate.state[5] = n[1]; // anchor y
+        vkdt.wstate.state[0] = vkdt.wstate.state[1] = n[0];
+        vkdt.wstate.state[2] = vkdt.wstate.state[3] = n[1];
+        vkdt.wstate.selected = 4;
+      }
+      } // end else (not dragging new crop)
       if(vkdt.wstate.selected < 0) do_events = 1; // enable zoom/panning around
     }
     else if(widget == dt_token("pick"))

@@ -296,6 +296,31 @@ dt_gui_dr_crop_adjust(
     // make sure min <= max
     if(vkdt.wstate.state[1] < vkdt.wstate.state[0]) { float tmp = vkdt.wstate.state[1]; vkdt.wstate.state[1] = vkdt.wstate.state[0]; vkdt.wstate.state[0] = tmp; }
     if(vkdt.wstate.state[3] < vkdt.wstate.state[2]) { float tmp = vkdt.wstate.state[3]; vkdt.wstate.state[3] = vkdt.wstate.state[2]; vkdt.wstate.state[2] = tmp; }
+    // clamp to image bounds in output (square) coordinate space
+    if(vkdt.wstate.active_widget_modid >= 0)
+    {
+      const int mid = vkdt.wstate.active_widget_modid;
+      const dt_module_t *mod = vkdt.graph_dev.module + mid;
+      const float rwd = mod->connector[0].roi.wd;
+      const float rht = mod->connector[0].roi.ht;
+      const float *p_rot = dt_module_param_float(mod, dt_module_get_param(mod->so, dt_token("rotate")));
+      float rot = p_rot[0];
+      if(rot == 1337.0f)
+      {
+        uint32_t ori = mod->img_param.orientation;
+        if(ori == 3)      rot = 180.0f;
+        else if(ori == 8) rot = 90.0f;
+        else if(ori == 6) rot = 270.0f;
+        else              rot = 0.0f;
+      }
+      const int sw = (rot >= 45 && rot < 135) || (rot >= 225 && rot < 315);
+      const float iwd = sw ? rht : rwd, iht = sw ? rwd : rht;
+      const float owd = MAX(rwd, rht);
+      vkdt.wstate.state[0] = CLAMP(vkdt.wstate.state[0], .5f - .5f*iwd/owd, .5f + .5f*iwd/owd);
+      vkdt.wstate.state[1] = CLAMP(vkdt.wstate.state[1], .5f - .5f*iwd/owd, .5f + .5f*iwd/owd);
+      vkdt.wstate.state[2] = CLAMP(vkdt.wstate.state[2], .5f - .5f*iht/owd, .5f + .5f*iht/owd);
+      vkdt.wstate.state[3] = CLAMP(vkdt.wstate.state[3], .5f - .5f*iht/owd, .5f + .5f*iht/owd);
+    }
   }
 }
 

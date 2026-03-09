@@ -68,6 +68,58 @@ static inline void widget_abort()
   vkdt.wstate.selected = -1;
 }
 
+static inline void
+dt_gui_dr_crop_start()
+{ // programmatically activate the crop widget (e.g. from hotkey)
+  int modid = dt_module_get(&vkdt.graph_dev, dt_token("crop"), dt_token("01"));
+  if(modid < 0) modid = dt_module_get(&vkdt.graph_dev, dt_token("crop"), dt_token("main"));
+  if(modid < 0) return;
+  int parid = dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("crop"));
+  if(parid < 0) return;
+  if(vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
+  { // already active, toggle off (act like "done")
+    const float iwd = vkdt.graph_dev.module[modid].connector[0].roi.wd;
+    const float iht = vkdt.graph_dev.module[modid].connector[0].roi.ht;
+    const float aspect = iwd/iht;
+    vkdt.wstate.state[0] = .5f + MAX(1.0f, 1.0f/aspect) * (vkdt.wstate.state[0] - .5f);
+    vkdt.wstate.state[1] = .5f + MAX(1.0f, 1.0f/aspect) * (vkdt.wstate.state[1] - .5f);
+    vkdt.wstate.state[2] = .5f + MAX(1.0f,      aspect) * (vkdt.wstate.state[2] - .5f);
+    vkdt.wstate.state[3] = .5f + MAX(1.0f,      aspect) * (vkdt.wstate.state[3] - .5f);
+    widget_end();
+    dt_image_reset_zoom(&vkdt.wstate.img_widget);
+    dt_graph_history_append(&vkdt.graph_dev, modid, parid, 0);
+    return;
+  }
+  const dt_ui_param_t *param = vkdt.graph_dev.module[modid].so->param[parid];
+  float *v = (float*)(vkdt.graph_dev.module[modid].param + param->offset);
+  const float iwd = vkdt.graph_dev.module[modid].connector[0].roi.wd;
+  const float iht = vkdt.graph_dev.module[modid].connector[0].roi.ht;
+  const float aspect = iwd/iht;
+  widget_end();
+  vkdt.wstate.active_widget_modid = modid;
+  vkdt.wstate.active_widget_parid = parid;
+  vkdt.wstate.active_widget_parnm = 0;
+  vkdt.wstate.active_widget_parsz = dt_ui_param_size(param->type, param->cnt);
+  memcpy(vkdt.wstate.state, v, sizeof(float)*4);
+  const float owd = MAX(iwd, iht);
+  const float oht = MAX(iwd, iht);
+  float *c = vkdt.wstate.state;
+  if(c[0] == 1.0 && c[1] == 3.0 && c[2] == 3.0 && c[3] == 7.0)
+  { c[0] = c[2] = 0.0f; c[1] = c[3] = 1.0f; }
+  c[0] = .5f + iwd/owd * (c[0] - .5f);
+  c[1] = .5f + iwd/owd * (c[1] - .5f);
+  c[2] = .5f + iht/oht * (c[2] - .5f);
+  c[3] = .5f + iht/oht * (c[3] - .5f);
+  float def[] = {
+    .5f + MAX(1.0f, 1.0f/aspect) * (0.0f - .5f),
+    .5f + MAX(1.0f, 1.0f/aspect) * (1.0f - .5f),
+    .5f + MAX(1.0f,      aspect) * (0.0f - .5f),
+    .5f + MAX(1.0f,      aspect) * (1.0f - .5f)};
+  memcpy(v, def, sizeof(float)*4);
+  vkdt.graph_dev.runflags = s_graph_run_all;
+  vkdt.wstate.img_widget.scale = 0.9;
+}
+
 static inline void render_perf_overlay()
 {
   const int nvmask = 127;

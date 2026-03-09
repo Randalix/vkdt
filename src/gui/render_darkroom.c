@@ -73,7 +73,8 @@ enum hotkey_names_t
   s_hotkey_reload_shaders  = 26,
   s_hotkey_copy_hist       = 27,
   s_hotkey_paste_hist      = 28,
-  s_hotkey_count           = 29,
+  s_hotkey_crop            = 29,
+  s_hotkey_count           = 30,
 };
 
 static const int hk_darkroom_size = 128;
@@ -108,6 +109,7 @@ static hk_t hk_darkroom[128] = {
   {"reload shaders",  "debug: reload shader code while running",    {}},
   {"copy history",    "copy history from curren image",             {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_C}},
   {"paste history",   "paste history to selected images",           {GLFW_KEY_LEFT_CONTROL,  GLFW_KEY_V}},
+  {"crop",            "activate crop tool",                         {GLFW_KEY_LEFT_SHIFT,    GLFW_KEY_C}},
 };
 
 // used to communictate between the gui helper functions
@@ -245,6 +247,9 @@ darkroom_keyboard(GLFWwindow *window, int key, int scancode, int action, int mod
       break;
     case s_hotkey_paste_hist:
       dt_gui_paste_history();
+      break;
+    case s_hotkey_crop:
+      dt_gui_dr_crop_start();
       break;
     default:
      if(gui.hotkey >= s_hotkey_count && gui.hotkey < hk_darkroom_cnt) dt_keyaccel_exec(hk_darkroom[gui.hotkey].name);
