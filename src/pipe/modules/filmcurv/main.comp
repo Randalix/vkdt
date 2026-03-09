@@ -193,8 +193,22 @@ main()
     // chroma compression: per-channel curve oversaturates midtones and
     // highlights. onset above shadows, strength tied to rolloff parameter.
     C1 *= 1.0 - 0.6 * params.rolloff * smoothstep(0.15, 0.5, lum1);
-    // hue: from original (no hue shift)
-    float h = atan(lab0.z, lab0.y);
+    // hue: from per-channel curve. the per-channel curve naturally narrows
+    // the hue range (compresses R:G:B ratios at highlights/shadows),
+    // matching the hue convergence that camera processing applies.
+    float h = atan(lab_pc.z, lab_pc.y);
+    // luminance-dependent hue convergence for skin/warm tones:
+    // camera processing compresses the hue spread between highlights and shadows,
+    // pulling warm hues toward a central skin hue (~55° = 0.96 rad in oklab).
+    // strength increases away from midtones; only applies to orange/skin hues.
+    float h_target = 0.96; // ~55° oklab, central skin hue
+    float h_dist = abs(mod(h - h_target + M_PI, 2.0*M_PI) - M_PI);
+    if(h_dist < 0.7) // ~40° window: only affects skin/orange/warm hues
+    {
+      float away = abs(lum1 - 0.35); // distance from midtone anchor
+      float converge = params.rolloff * 1.0 * smoothstep(0.0, 0.3, away);
+      h = lerp_chromaticity_angle(h, h_target, converge);
+    }
     // chroma: 0=mono, 1=natural per-channel desaturation, >1=boost
     float cr = max(params.chroma, 0.0);
     // hue-dependent chroma correction using smooth raised cosine bumps.
