@@ -159,27 +159,21 @@ main()
     col1 = agx(col0, il, k);
   }
   else if (params.colourmode == 5)
-  { // hybrid oklab: L from luminance curve, C from per-channel, h from original.
-    // per-channel curve provides natural hue-dependent desaturation,
-    // oklab decomposition prevents hue shifts, luminance curve gives clean lightness.
+  { // lum ratio: oklab LCh decomposition with luminance-driven lightness.
+    // separating L/C/h avoids the hue shifts of per-channel curves while
+    // keeping their natural saturation rolloff in highlights and shadows.
     vec3 lab0 = rec2020_to_oklab(col0);
     float L0 = max(lab0.x, 1e-7);
-    // lightness: curve applied to luminance (clean, no per-channel artifacts)
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum0 = max(dot(col0, lw), 1e-7);
     float lum1 = weibull_cdf(lum0, il, k);
-    // highlight rolloff: soft-clamp display luminance above shoulder.
-    // reinhard-style x/(1+x*s): smooth, derivative-continuous at threshold,
-    // compression increases toward the top. threshold 0.5 catches highlights
-    // before they clip in the sRGB encoding stage.
+    // reinhard rolloff above shoulder prevents clipping in sRGB encoding
     if(params.rolloff > 0.0 && lum1 > 0.5)
     {
       float x = lum1 - 0.5;
       lum1 = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
     }
-    // shadow toe: gamma lift in shadows for detail and color.
-    // independent from brightness/contrast, only affects dark tones.
-    // gamma < 1 lifts shadows; blend fades to zero in midtones.
+    // shadow toe: independent from brightness/contrast
     if(params.shadows > 0.0)
     {
       float toe_gamma = 1.0 - 0.5 * params.shadows;
@@ -187,33 +181,25 @@ main()
       lum1 = mix(lum1, lum_toe, smoothstep(0.3, 0.0, lum1));
     }
     float L1 = L0 * pow(lum1 / lum0, 1.0/3.0);
-    // chroma from per-channel curve: natural hue-dependent desaturation.
+    // chroma from per-channel curve: preserves natural saturation rolloff
     vec3 lab_pc = rec2020_to_oklab(weibull_cdf(col0, il, k));
     float C1 = length(lab_pc.yz);
-    // chroma compression: per-channel curve oversaturates midtones and
-    // highlights. onset above shadows, strength tied to rolloff parameter.
+    // tame per-channel oversaturation in midtones/highlights
     C1 *= 1.0 - 0.6 * params.rolloff * smoothstep(0.15, 0.5, lum1);
-    // hue: from per-channel curve. the per-channel curve naturally narrows
-    // the hue range (compresses R:G:B ratios at highlights/shadows),
-    // matching the hue convergence that camera processing applies.
     float h = atan(lab_pc.z, lab_pc.y);
-    // luminance-dependent hue convergence for skin/warm tones:
-    // camera processing compresses the hue spread between highlights and shadows,
-    // pulling warm hues toward a central skin hue (~55° = 0.96 rad in oklab).
-    // strength increases away from midtones; only applies to orange/skin hues.
-    float h_target = 0.96; // ~55° oklab, central skin hue
+    // converge warm/skin hues toward ~55° oklab in highlights and shadows
+    // to reduce hue spread, giving a more coherent look on skin tones
+    float h_target = 0.96;
     float h_dist = abs(mod(h - h_target + M_PI, 2.0*M_PI) - M_PI);
-    if(h_dist < 0.7) // ~40° window: only affects skin/orange/warm hues
+    if(h_dist < 0.7)
     {
-      float away = abs(lum1 - 0.35); // distance from midtone anchor
+      float away = abs(lum1 - 0.35);
       float converge = params.rolloff * 1.0 * smoothstep(0.0, 0.3, away);
       h = lerp_chromaticity_angle(h, h_target, converge);
     }
-    // chroma: 0=mono, 1=natural per-channel desaturation, >1=boost
+    // chroma: 0=mono, 1=natural, >1=boost
     float cr = max(params.chroma, 0.0);
-    // hue-dependent chroma correction using smooth raised cosine bumps.
-    // compensates per-channel curve's uneven desaturation across hues.
-    // oklab hue centers: red ~0.7rad, yellow ~1.76rad, blue ~-1.76rad.
+    // per-hue chroma trim to compensate uneven per-channel desaturation
     cr *= 1.0
       + params.red    * hue_bump(h, 0.7,   1.0)
       + params.yellow * hue_bump(h, 1.76,  1.0)
@@ -248,10 +234,10 @@ main()
     return;
   }
 
-  // highlight rolloff: soft-clamp display luminance above shoulder.
+  // reinhard rolloff above shoulder prevents clipping in sRGB encoding
   if(params.rolloff > 0.0)
   {
-    const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
+    const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum1 = max(dot(col1, lw), 1e-7);
     if(lum1 > 0.5)
     {
@@ -261,19 +247,15 @@ main()
     }
   }
 
-  // chroma preservation: compensate tone curve's saturation loss.
-  // highlights: use curve derivative to boost where slope < 1 (compression zone).
-  // shadows: smoothstep-based boost compensating for hunt effect.
-  // single 'chroma' parameter drives both, 0=off, 1=moderate, 2=strong.
+  // compensate tone curve's saturation loss using curve derivative (highlights)
+  // and hunt effect correction (shadows)
   if(params.chroma != 0.0)
   {
-    const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
+    const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum0 = max(dot(col0, lw), 1e-7);
     float lum1 = max(dot(col1, lw), 1e-7);
-    // highlight compensation: where curve slope < 1, boost by 1/slope
     float deriv = weibull_pdf(lum0, il, k);
     float hi = pow(max(1.0, 1.0 / max(deriv, 0.15)), params.chroma * 0.1);
-    // shadow compensation: hunt effect, boost chroma in dark tones
     float sw = smoothstep(0.3, 0.0, lum1);
     float lo = 1.0 + params.chroma * 0.15 * sw;
     col1 = mix(vec3(lum1), col1, hi * lo);
