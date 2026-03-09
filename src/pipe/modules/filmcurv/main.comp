@@ -167,7 +167,18 @@ main()
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593);
     float lum0 = max(dot(col0, lw), 1e-7);
     float lum1 = weibull_cdf(lum0, il, k);
-    if(params.rolloff > 0.0) lum1 = pow(lum1, 1.0 + params.rolloff);
+    // highlight rolloff: compress display luminance above knee point.
+    // pow on normalised highlight range gives strong shoulder without affecting midtones.
+    if(params.rolloff > 0.0)
+    {
+      const float knee = 0.5;
+      if(lum1 > knee)
+      {
+        float x = (lum1 - knee) / (1.0 - knee); // normalise [knee, 1] to [0, 1]
+        x = pow(x, 1.0 + params.rolloff * 3.0);  // compress highlights
+        lum1 = knee + x * (1.0 - knee);           // remap back
+      }
+    }
     float L1 = L0 * pow(lum1 / lum0, 1.0/3.0);
     // chroma from per-channel curve: natural hue-dependent desaturation.
     vec3 lab_pc = rec2020_to_oklab(weibull_cdf(col0, il, k));
@@ -192,25 +203,36 @@ main()
       vec4 col_crv = vec4(0, 0, 0, 1);
       float x = ipos.x/float(imageSize(img_crv).x);
       float y = weibull_cdf(x, il, k);
-      if(params.rolloff > 0.0) y = pow(y, 1.0 + params.rolloff);
+      if(params.rolloff > 0.0 && y > 0.5)
+      {
+        float nx = (y - 0.5) / 0.5;
+        nx = pow(nx, 1.0 + params.rolloff * 3.0);
+        y = 0.5 + nx * 0.5;
+      }
       float ddx = weibull_pdf(x, il, k);
       const float w = 2.0;
-      float t = w * sqrt(1.0 + ddx*ddx);
+      float t2 = w * sqrt(1.0 + ddx*ddx);
       float d = abs((1.0-y) * imageSize(img_crv).y - ipos.y);
-      col_crv = max(col_crv, 0.2 * vec4(vec3(smoothstep(t, 0.0, d)), 1));
+      col_crv = max(col_crv, 0.2 * vec4(vec3(smoothstep(t2, 0.0, d)), 1));
       imageStore(img_crv, ipos, col_crv);
     }
     return;
   }
 
-  // highlight rolloff: compress display luminance to steepen shoulder.
-  // pow(lum, 1+rolloff) pulls down mid/low values more than highlights.
+  // highlight rolloff: compress display luminance above knee point.
+  // only affects highlights, leaving shadows and midtones untouched.
   if(params.rolloff > 0.0)
   {
     const vec3 lw = vec3(0.2627, 0.6780, 0.0593); // rec2020 luminance
+    const float knee = 0.5;
     float lum1 = max(dot(col1, lw), 1e-7);
-    float new_lum = pow(lum1, 1.0 + params.rolloff);
-    col1 *= new_lum / lum1;
+    if(lum1 > knee)
+    {
+      float x = (lum1 - knee) / (1.0 - knee);
+      x = pow(x, 1.0 + params.rolloff * 3.0);
+      float new_lum = knee + x * (1.0 - knee);
+      col1 *= new_lum / lum1;
+    }
   }
 
   // chroma preservation: compensate tone curve's saturation loss.
