@@ -83,6 +83,14 @@ dt_graph_init(dt_graph_t *g, qvk_queue_name_t qname)
   vkCreateSemaphore(qvk.device, &createInfo, NULL, &g->semaphore_process);
   for(int i=0;i<2;i++)
   {
+#ifdef __APPLE__
+    g->query[i].max = 0; // timestamp queries crash MoltenVK (finishQueries use-after-free)
+    g->query[i].cnt = 0;
+    g->query[i].pool = VK_NULL_HANDLE;
+    g->query[i].pool_results = 0;
+    g->query[i].name   = 0;
+    g->query[i].kernel = 0;
+#else
     g->query[i].max = 2000;
     g->query[i].cnt = 0;
     VkQueryPoolCreateInfo query_pool_info = {
@@ -94,6 +102,7 @@ dt_graph_init(dt_graph_t *g, qvk_queue_name_t qname)
     g->query[i].pool_results = malloc(sizeof(uint64_t)*g->query[i].max);
     g->query[i].name   = malloc(sizeof(dt_token_t)*g->query[i].max);
     g->query[i].kernel = malloc(sizeof(dt_token_t)*g->query[i].max);
+#endif
   }
 
   g->lod_scale = 1;
