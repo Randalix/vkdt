@@ -4,3 +4,6 @@ bias:slider:0:0.02
 colour:combo:darktable ucs:per channel:munsell:hsl:agx:lum ratio
 chroma:slider:0:2
 rolloff:slider:0:0.5
+red:slider:-0.5:0.5
+yellow:slider:-0.5:0.5
+blue:slider:-0.5:0.5

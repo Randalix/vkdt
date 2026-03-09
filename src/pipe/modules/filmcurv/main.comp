@@ -18,6 +18,9 @@ layout(std140, set = 0, binding = 1) uniform params_t
   int   colourmode;
   float chroma;
   float rolloff;
+  float red;
+  float yellow;
+  float blue;
 } params;
 
 layout(set = 1, binding = 0) uniform sampler2D img_in;
@@ -94,6 +97,13 @@ agx(vec3 color, float il, float k)
   return color;
 }
 
+// raised cosine bump: smooth, non-overshooting, zero outside [-w, w]
+float hue_bump(float h, float h0, float w)
+{
+  float d = abs(mod(h - h0 + M_PI, 2.0*M_PI) - M_PI);
+  return d < w ? 0.5 + 0.5 * cos(M_PI * d / w) : 0.0;
+}
+
 void
 main()
 {
@@ -166,6 +176,13 @@ main()
     float h = atan(lab0.z, lab0.y);
     // chroma: 0=mono, 1=natural per-channel desaturation, >1=boost
     float cr = max(params.chroma, 0.0);
+    // hue-dependent chroma correction using smooth raised cosine bumps.
+    // compensates per-channel curve's uneven desaturation across hues.
+    // oklab hue centers: red ~0.7rad, yellow ~1.76rad, blue ~-1.76rad.
+    cr *= 1.0
+      + params.red    * hue_bump(h, 0.7,   1.0)
+      + params.yellow * hue_bump(h, 1.76,  1.0)
+      + params.blue   * hue_bump(h, -1.76, 1.0);
     vec3 lab1 = vec3(L1, C1 * cr * cos(h), C1 * cr * sin(h));
     col1 = oklab_to_rec2020(lab1);
     // skip rolloff and chroma blocks below (already handled)
