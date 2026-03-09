@@ -7,3 +7,4 @@ rolloff:float:1:0.0
 red:float:1:0.0
 yellow:float:1:0.0
 blue:float:1:0.0
+shadows:float:1:0.0

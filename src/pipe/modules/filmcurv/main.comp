@@ -21,6 +21,7 @@ layout(std140, set = 0, binding = 1) uniform params_t
   float red;
   float yellow;
   float blue;
+  float shadows;
 } params;
 
 layout(set = 1, binding = 0) uniform sampler2D img_in;
@@ -176,14 +177,22 @@ main()
       float x = lum1 - 0.5;
       lum1 = 0.5 + x / (1.0 + x * params.rolloff * 4.0);
     }
+    // shadow toe: gamma lift in shadows for detail and color.
+    // independent from brightness/contrast, only affects dark tones.
+    // gamma < 1 lifts shadows; blend fades to zero in midtones.
+    if(params.shadows > 0.0)
+    {
+      float toe_gamma = 1.0 - 0.5 * params.shadows;
+      float lum_toe = pow(max(lum1, 1e-7), toe_gamma);
+      lum1 = mix(lum1, lum_toe, smoothstep(0.3, 0.0, lum1));
+    }
     float L1 = L0 * pow(lum1 / lum0, 1.0/3.0);
     // chroma from per-channel curve: natural hue-dependent desaturation.
     vec3 lab_pc = rec2020_to_oklab(weibull_cdf(col0, il, k));
     float C1 = length(lab_pc.yz);
     // chroma compression: per-channel curve oversaturates midtones and
-    // highlights relative to Canon. onset from shadows into midtones,
-    // strength tied to rolloff parameter.
-    C1 *= 1.0 - 0.6 * params.rolloff * smoothstep(0.1, 0.5, lum1);
+    // highlights. onset above shadows, strength tied to rolloff parameter.
+    C1 *= 1.0 - 0.6 * params.rolloff * smoothstep(0.15, 0.5, lum1);
     // hue: from original (no hue shift)
     float h = atan(lab0.z, lab0.y);
     // chroma: 0=mono, 1=natural per-channel desaturation, >1=boost
@@ -208,6 +217,12 @@ main()
       {
         float nx = y - 0.5;
         y = 0.5 + nx / (1.0 + nx * params.rolloff * 4.0);
+      }
+      if(params.shadows > 0.0)
+      {
+        float tg = 1.0 - 0.5 * params.shadows;
+        float yt = pow(max(y, 1e-7), tg);
+        y = mix(y, yt, smoothstep(0.3, 0.0, y));
       }
       float ddx = weibull_pdf(x, il, k);
       const float w = 2.0;
