@@ -65,18 +65,18 @@ main()
   down4 *= exp2(mask * params.s4);
 
   vec3 tt = vec3(0.0);
-  float ht = 2.0, thrs;
+  float thrs;
   thrs = mask * params.s0;
-  tt = min(vec3(1.0), abs(down3)/(2*thrs));
+  tt = thrs > 0.0 ? min(vec3(1.0), abs(down3)/(2*thrs)) : vec3(1.0);
   down4 += sigma * b3 * sign(down3) * mix(max(abs(down3) - thrs, vec3(0.0)), abs(down3), tt);
   thrs = mask * params.s1;
-  tt = min(vec3(1.0), abs(down2)/(2*thrs));
+  tt = thrs > 0.0 ? min(vec3(1.0), abs(down2)/(2*thrs)) : vec3(1.0);
   down4 += sigma * b2 * sign(down2) * mix(max(abs(down2) - thrs, vec3(0.0)), abs(down2), tt);
   thrs = mask * params.s2;
-  tt = min(vec3(1.0), abs(down1)/(2*thrs));
+  tt = thrs > 0.0 ? min(vec3(1.0), abs(down1)/(2*thrs)) : vec3(1.0);
   down4 += sigma * b1 * sign(down1) * mix(max(abs(down1) - thrs, vec3(0.0)), abs(down1), tt);
   thrs = mask * params.s3;
-  tt = min(vec3(1.0), abs(down0)/(2*thrs));
+  tt = thrs > 0.0 ? min(vec3(1.0), abs(down0)/(2*thrs)) : vec3(1.0);
   down4 += sigma * b0 * sign(down0) * mix(max(abs(down0) - thrs, vec3(0.0)), abs(down0), tt);
 
   imageStore(img_out, ipos, vec4(down4, 1));
