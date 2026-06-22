@@ -100,7 +100,7 @@ function reorderBar(){
 }
 
 // ---- shared value scrub (drag anywhere — no need to hit a slider) ----
-const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3, WHEEL:4 };
+const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3, WHEEL:4, CROP:5 };
 let state=ST.IDLE, cx=0, cy=0, curGroup=-1, hover=-1;
 let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1, scrubbing=false;
 const R =()=>Math.min(innerWidth,innerHeight)*0.34, R0=()=>R()*0.4;
@@ -125,8 +125,40 @@ function wheelMaster(dx){ const it=whItem, range=it.max-it.min;
 
 function enterValue(gi,pi){ const it=groups[gi].items[pi];
   if(it.kind==='wheel'){ enterWheel(gi,pi); return; }
+  if(it.kind==='crop'){ enterCrop(gi,pi); return; }
   valGI=gi; valPI=pi; valItem=it; state=ST.VALUE; scrubbing=false;
   markActive(gi,pi); drawOverlay(); hud.textContent=`${it.label} — drag anywhere`; }
+
+// ---- crop tool: rectangle handles on the (uncropped) image ----
+let cropItem=null, crGI=-1, crPI=-1, cr=[0,1,0,1], crHandle=null, crLX=0, crLY=0;
+function sendCropVec(gi,pi,a){ rawSend(()=>ws.send(`V ${groups[gi].modid} ${groups[gi].items[pi].parid} ${a.join(' ')}`)); }
+function imgRect(){ if(!lastBmp) return {ix:0,iy:0,iw:innerWidth,ih:innerHeight};
+  const base=Math.min(innerWidth/lastBmp.width, innerHeight/lastBmp.height)*view.scale;
+  const iw=lastBmp.width*base, ih=lastBmp.height*base;
+  return {ix:(innerWidth-iw)/2+view.tx, iy:(innerHeight-ih)/2+view.ty, iw, ih}; }
+function enterCrop(gi,pi){ crGI=gi; crPI=pi; cropItem=groups[gi].items[pi];
+  const c=cropItem.cur;
+  cr = (Array.isArray(c)&&c[1]<=1.001&&c[3]<=1.001&&c[1]>c[0]&&c[3]>c[2])
+       ? [Math.max(0,c[0]),Math.min(1,c[1]),Math.max(0,c[2]),Math.min(1,c[3])] : [0,1,0,1];
+  crHandle=null; state=ST.CROP; markActive(gi,pi);
+  sendCropVec(gi,pi,[0,1,0,1]);            // show the full uncropped image while editing
+  drawOverlay(); hud.textContent='crop — drag corners/edges · tap = apply'; }
+function cropHandleAt(x,y){ const r=imgRect(), th=30;
+  const L=r.ix+cr[0]*r.iw, R=r.ix+cr[1]*r.iw, T=r.iy+cr[2]*r.ih, B=r.iy+cr[3]*r.ih, near=(a,b)=>Math.abs(a-b)<=th;
+  const nx=near(x,L)?'l':near(x,R)?'r':'', ny=near(y,T)?'t':near(y,B)?'b':'';
+  if(nx&&ny) return ny+nx;                       // corner e.g. 'tl'
+  if(nx && y>T-th && y<B+th) return nx;          // vertical edge
+  if(ny && x>L-th && x<R+th) return ny;          // horizontal edge
+  if(x>L&&x<R&&y>T&&y<B) return 'move';
+  return null; }
+function cropDrag(x,y,dx,dy){ const r=imgRect(), MIN=0.05, h=crHandle;
+  const fx=v=>Math.max(0,Math.min(1,(v-r.ix)/r.iw)), fy=v=>Math.max(0,Math.min(1,(v-r.iy)/r.ih));
+  if(h==='move'){ let ddx=Math.max(-cr[0],Math.min(1-cr[1],dx/r.iw)), ddy=Math.max(-cr[2],Math.min(1-cr[3],dy/r.ih));
+    cr[0]+=ddx; cr[1]+=ddx; cr[2]+=ddy; cr[3]+=ddy; return; }
+  if(h.includes('l')) cr[0]=Math.min(fx(x), cr[1]-MIN);
+  if(h.includes('r')) cr[1]=Math.max(fx(x), cr[0]+MIN);
+  if(h.includes('t')) cr[2]=Math.min(fy(y), cr[3]-MIN);
+  if(h.includes('b')) cr[3]=Math.max(fy(y), cr[2]+MIN); }
 
 function ringItems(){ if(state===ST.GROUPS) return groups.map(g=>g.label);
   if(state===ST.PARAMS) return groups[curGroup].items.map(it=>it.label); return []; }
@@ -138,6 +170,17 @@ function drawOverlay(){
   fitCanvas(ovr); const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
   octx.clearRect(0,0,innerWidth,innerHeight);
   if(state===ST.IDLE) return;
+  if(state===ST.CROP){
+    const r=imgRect(), L=r.ix+cr[0]*r.iw, R=r.ix+cr[1]*r.iw, T=r.iy+cr[2]*r.ih, B=r.iy+cr[3]*r.ih;
+    octx.strokeStyle='rgba(255,255,255,.9)'; octx.lineWidth=2; octx.strokeRect(L,T,R-L,B-T);
+    octx.strokeStyle='rgba(255,255,255,.25)'; octx.lineWidth=1; octx.beginPath();
+    for(let k=1;k<3;k++){ const gx=L+(R-L)*k/3, gy=T+(B-T)*k/3;
+      octx.moveTo(gx,T); octx.lineTo(gx,B); octx.moveTo(L,gy); octx.lineTo(R,gy); } octx.stroke();
+    octx.strokeStyle='#fff'; octx.lineWidth=4; const tk=18;
+    const corner=(x,y,sx,sy)=>{ octx.beginPath(); octx.moveTo(x+sx*tk,y); octx.lineTo(x,y); octx.lineTo(x,y+sy*tk); octx.stroke(); };
+    corner(L,T,1,1); corner(R,T,-1,1); corner(L,B,1,-1); corner(R,B,-1,-1);
+    return;
+  }
   if(state===ST.WHEEL){
     const it=whItem, ccx=WCX(), ccy=WCY(), r=WR(), def=it.def, cur=it.cur;
     const rIn=r*0.88;  // thin ring only — never fill the centre, image stays visible
@@ -221,6 +264,7 @@ ovr.addEventListener('pointerdown', e=>{
     const my=WCY()+WR()+26, mw=WR()*1.6, mx=WCX()-mw/2;
     whDrag=(p.x>=mx-14 && p.x<=mx+mw+14 && Math.abs(p.y-my)<28)?'master':'chroma'; whLX=p.x; whLY=p.y;
   }
+  else if(state===ST.CROP){ crHandle=cropHandleAt(p.x,p.y); crLX=p.x; crLY=p.y; }
   else if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; }
   else if(state===ST.GROUPS||state===ST.PARAMS){ hover=pick(p.x,p.y); drawOverlay(); }
   else { pressArmed=true; clearTimeout(holdTimer);   // IDLE: arm long-press to open radial
@@ -232,6 +276,7 @@ ovr.addEventListener('pointermove', e=>{
   if(blockRadial) return;
   const p=pos(e); if(Math.hypot(p.x-downX,p.y-downY)>MOVE_TH) moved=true;
   if(state===ST.IDLE){ if(pressArmed && moved) cancelHold(); return; }  // moved before hold = swipe, no radial
+  if(state===ST.CROP){ if(crHandle){ cropDrag(p.x,p.y, p.x-crLX, p.y-crLY); crLX=p.x; crLY=p.y; drawOverlay(); } return; }
   if(state===ST.WHEEL){ if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y;
       if(whDrag==='chroma') wheelChroma(dx,dy); else wheelMaster(dx); drawOverlay(); } return; }
   if(state===ST.VALUE){ if(scrubbing){ const range=valItem.max-valItem.min;
@@ -246,6 +291,10 @@ function endPointer(e){
   if(blockRadial){ blockRadial=false; pinch=null; return; }
   const p=pos(e), tap=!moved;
   if(state===ST.IDLE){ cancelHold(); return; }   // short tap in idle → nothing (radial opens on hold)
+  if(state===ST.CROP){
+    if(tap){ sendCropVec(crGI,crPI,cr); state=ST.IDLE; crHandle=null; markActive(-1); hud.textContent='hold or tap'; } // apply & close
+    else crHandle=null;                                                                                               // handle drag → keep editing
+    drawOverlay(); return; }
   if(state===ST.GROUPS){ const sel=pick(p.x,p.y);
     if(sel>=0){ curGroup=sel; const c=clampRing(p.x,p.y); cx=c.x; cy=c.y; state=ST.PARAMS; hover=-1; hud.textContent='drag to a parameter'; }
     else if(!justOpened) { state=ST.IDLE; hud.textContent='hold or tap'; }

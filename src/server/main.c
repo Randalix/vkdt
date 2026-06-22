@@ -53,7 +53,15 @@ static inline int is_wheel(const dt_ui_param_t *p)
 { // colour wheel: rgb chroma + master, float[4]
   return p->widget.type == dt_token("colwheel") && p->type == dt_token("float") && p->cnt == 4;
 }
-static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p); }
+static inline int is_crop(const dt_ui_param_t *p)
+{ // crop rect (x,X,y,Y) fractions, float[4]
+  return p->widget.type == dt_token("crop") && p->type == dt_token("float") && p->cnt == 4;
+}
+static inline int is_straight(const dt_ui_param_t *p)
+{ // rotate angle (degrees), float[1] — vkdt "straight" widget
+  return p->widget.type == dt_token("straight") && p->type == dt_token("float") && p->cnt == 1;
+}
+static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p) || is_crop(p) || is_straight(p); }
 
 static inline float param_get(int modid, int parid)
 {
@@ -135,6 +143,18 @@ static void build_menu_json(void)
         o += snprintf(o, e-o, "\",\"kind\":\"wheel\",\"parid\":%d,\"min\":%g,\"max\":%g,"
             "\"def\":[%g,%g,%g,%g],\"cur\":[%g,%g,%g,%g]}",
             pi, p->widget.min, p->widget.max, d[0],d[1],d[2],d[3], c[0],c[1],c[2],c[3]);
+      }
+      else if(is_crop(p))
+      {
+        const float *c = (const float *)((uint8_t *)g_graph.module[m].param + p->offset);
+        o += snprintf(o, e-o, "\",\"kind\":\"crop\",\"parid\":%d,\"cur\":[%g,%g,%g,%g]}",
+            pi, c[0],c[1],c[2],c[3]);
+      }
+      else if(is_straight(p))
+      { // rotate: expose as a 1D slider in degrees; 1337 is the EXIF sentinel -> show 0
+        float cur = param_get(m, pi); if(cur == 1337.0f) cur = 0.0f;
+        o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":-180,\"max\":180,\"def\":0,\"cur\":%g}",
+            pi, cur);
       }
       else o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
           pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
