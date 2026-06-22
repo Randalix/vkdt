@@ -40,6 +40,8 @@ static const char     *g_jpgbase = "preview";
 static char            g_jpgpath[512];
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
+static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
+static volatile int    g_dirty = 0;           // edits pending an autosave
 
 static inline double now_ms()
 {
@@ -202,6 +204,8 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   char tmp[128]; size_t k = len < sizeof(tmp)-1 ? len : sizeof(tmp)-1;
   memcpy(tmp, data, k); tmp[k] = 0;
 
+  if(!strncmp(tmp, "save", 4)) { recipe_save(); return 1; }  // explicit save (autosave also runs)
+
   int modid, parid; float v;
   if(sscanf(tmp, "P %d %d %f", &modid, &parid, &v) == 3 &&
      modid >= 0 && modid < g_graph.num_modules)
@@ -223,6 +227,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       free(b);
       fprintf(stderr, "[srv] set %d:%d = %g  render %.1f ms  %zu B\n", modid, parid, v, ms, n);
     }
+    g_dirty = 1;
     return 1;
   }
 
@@ -249,6 +254,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       free(b);
       fprintf(stderr, "[srv] setvec %d:%d  render %.1f ms  %zu B\n", modid, parid, ms, n);
     }
+    g_dirty = 1;
   }
   return 1;
 }
@@ -288,6 +294,26 @@ static int make_proxy(const char *in, const char *out, int maxdim)
   return 0;
 }
 
+// persist the current edit as a vkdt .cfg sidecar next to the image. The recipe is
+// server-authoritative; the phone holds nothing canonical. (See wiki: Session, Recipe
+// & Library Model.) The written .cfg references the preview proxy as input — on load we
+// only overlay the param: lines onto the freshly built template pipeline.
+static void recipe_save(void)
+{
+  if(!g_recipe_path[0]) return;
+  pthread_mutex_lock(&g_lock);
+  int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
+  pthread_mutex_unlock(&g_lock);
+  fprintf(stderr, "[srv] recipe %s\n", err ? "WRITE FAILED" : "saved");
+}
+// debounced autosave: write at most every ~2s while there are pending edits.
+static void *autosave_thread(void *u)
+{
+  (void)u;
+  while(!g_stop) { sleep(2); if(g_dirty) { g_dirty = 0; recipe_save(); } }
+  return NULL;
+}
+
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char *argv[])
@@ -319,6 +345,8 @@ int main(int argc, char *argv[])
 
   // preview proxy: full-res source would be re-decoded each frame (~400ms/12MP).
   // edit a downscaled proxy; full-res is only for export (M5). TODO keep source resident.
+  if(image) snprintf(g_recipe_path, sizeof(g_recipe_path), "%s.cfg", image);  // recipe sidecar
+
   const char *use_image = image;
   char proxypath[1024];
   if(image)
@@ -340,6 +368,31 @@ int main(int argc, char *argv[])
   { fprintf(stderr, "[srv] graph setup failed for '%s'\n", cfg); return 1; }
 
   snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
+
+  // restore a previously saved recipe: overlay its param: lines onto the template
+  // pipeline (structure stays from cfg; only edits are restored). Skip the i-jpg input
+  // (server-managed via the proxy). Server is now authoritative for the edit state.
+  if(g_recipe_path[0] && access(g_recipe_path, R_OK) == 0)
+  {
+    FILE *rf = fopen(g_recipe_path, "r");
+    if(rf)
+    {
+      char line[4096]; int applied = 0;
+      while(fgets(line, sizeof(line), rf))
+      {
+        line[strcspn(line, "\r\n")] = 0;
+        if(strncmp(line, "param:", 6)) continue;
+        if(!strncmp(line, "param:i-jpg:", 12)) continue;
+        if(dt_graph_read_config_line(&g_graph, line) == 0) applied++;
+      }
+      fclose(rf);
+      size_t n = 0; double ms = 0;
+      unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all);  // commit overlaid params
+      free(b);
+      fprintf(stderr, "[srv] recipe restored: %d params from %s\n", applied, g_recipe_path);
+    }
+  }
+
   build_menu_json();
   fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B\n", g_jpgpath, strlen(g_menu_json));
 
@@ -360,10 +413,14 @@ int main(int argc, char *argv[])
   if(!ctx) { fprintf(stderr, "[srv] mg_start failed (port %s)\n", port); return 1; }
   mg_set_websocket_handler(ctx, "/ws", ws_connect, ws_ready, ws_data, ws_close, NULL);
 
+  pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
+
   fprintf(stderr, "[srv] listening on :%s  docroot=%s  (Ctrl-C to stop)\n", port, docroot);
   while(!g_stop) sleep(1);
 
   fprintf(stderr, "[srv] shutting down\n");
+  pthread_join(as, NULL);
+  if(g_dirty) recipe_save();  // flush any pending edit
   mg_stop(ctx);
   mg_exit_library();
   dt_graph_cleanup(&g_graph);
