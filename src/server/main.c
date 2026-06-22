@@ -402,6 +402,9 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old0);
     if(is_crop(p)) fl |= s_graph_run_all;  // crop changes ROI -> needs modify_roi re-run
+    lg("dbg", "V mod=%d par=%d crop=%d cnt=%d w=[%g %g %g %g] fl=%u in=%dx%d out=%dx%d", modid, parid,
+        is_crop(p), p->cnt, w[0],w[1],w[2],w[3], (unsigned)fl,
+        m->connector[0].roi.full_wd, m->connector[0].roi.full_ht, m->connector[1].roi.full_wd, m->connector[1].roi.full_ht);
     g_graph.active_module = modid;
     dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
