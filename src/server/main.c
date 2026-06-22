@@ -259,7 +259,8 @@ int main(int argc, char *argv[])
     "num_threads",     "4",
     "enable_directory_listing", "no",
     "tcp_nodelay",     "1",
-    "static_file_max_age", "0",  // no client caching: always serve the current client during dev
+    "static_file_max_age", "0",
+    "additional_header", "Cache-Control: no-store",  // never cache the client during dev
     NULL
   };
   struct mg_callbacks cb; memset(&cb, 0, sizeof(cb));
