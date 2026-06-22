@@ -30,6 +30,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -44,7 +45,10 @@ static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
 static volatile int    g_dirty = 0;           // edits pending an autosave
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
+static const char     *g_cfg = "examples/m3.cfg";  // template pipeline
+static char            g_libdir[512] = "uploads";  // where uploaded/library images live
 static void recipe_save(void);
+static int  open_image(const char *image);    // (re)build the warm graph for an image
 
 static inline double now_ms()
 {
@@ -250,6 +254,22 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
 
   if(!strncmp(tmp, "save", 4)) { recipe_save(); return 1; }  // explicit save (autosave also runs)
 
+  if(!strncmp(tmp, "open ", 5))
+  { // switch to a library image: flush current edits, rebuild graph, resync client
+    char name[120]; snprintf(name, sizeof(name), "%s", tmp + 5);
+    char *bn = name; for(char *p = name; *p; p++) if(*p=='/' || *p=='\\') bn = p+1;
+    if(*bn && !strstr(bn, ".."))
+    {
+      if(g_dirty) recipe_save();
+      char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_libdir, bn);
+      pthread_mutex_lock(&g_lock);
+      int err = open_image(path);
+      pthread_mutex_unlock(&g_lock);
+      if(!err) { after_graph_change(c); g_dirty = 0; }  // freshly opened: not dirty
+    }
+    return 1;
+  }
+
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "undo", 4))
   {
@@ -384,6 +404,76 @@ static int make_proxy(const char *in, const char *out, int maxdim)
   return 0;
 }
 
+// (re)build the warm graph for `image` (NULL = use the cfg's own input). Tears down any
+// previous graph, exports the template pipeline against a downscaled preview proxy,
+// restores the image's recipe sidecar (param overlay), and baselines history. Call with
+// g_lock held when re-opening at runtime.
+static int open_image(const char *image)
+{
+  static int built = 0;
+  if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
+  dt_graph_init(&g_graph, s_queue_compute);
+  snprintf(g_graph.searchpath, sizeof(g_graph.searchpath), ".");
+  built = 1;
+
+  dt_graph_export_t param = {0};
+  param.p_cfgfile  = g_cfg;
+  param.output_cnt = 1;
+  param.output[0].inst             = dt_token("main");
+  param.output[0].mod              = dt_token("o-jpg");
+  param.output[0].p_filename       = g_jpgbase;
+  param.output[0].quality          = 90;
+  param.output[0].colour_primaries = s_colour_primaries_srgb;
+  param.output[0].colour_trc       = s_colour_trc_srgb;
+  param.output[0].max_width        = 1280;
+  param.output[0].max_height       = 1280;
+
+  const char *use_image = image;
+  char proxypath[1024], imgline[1280]; char *extra[1];
+  if(image)
+  {
+    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
+    if(make_proxy(image, proxypath, 1600) == 0 && access(proxypath, R_OK) == 0)
+    { use_image = proxypath; fprintf(stderr, "[srv] preview proxy <- %s\n", image); }
+    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow)\n", image);
+    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
+    extra[0] = imgline; param.extra_param_cnt = 1; param.p_extra_param = extra;
+  }
+  if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
+  { fprintf(stderr, "[srv] graph setup failed for '%s'\n", g_cfg); return 1; }
+  snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
+
+  // restore this image's recipe (param overlay onto the template; skip i-jpg input)
+  g_recipe_path[0] = 0;
+  if(image)
+  {
+    snprintf(g_recipe_path, sizeof(g_recipe_path), "%s.cfg", image);
+    if(access(g_recipe_path, R_OK) == 0)
+    {
+      FILE *rf = fopen(g_recipe_path, "r");
+      if(rf)
+      {
+        char line[4096]; int applied = 0;
+        while(fgets(line, sizeof(line), rf))
+        {
+          line[strcspn(line, "\r\n")] = 0;
+          if(strncmp(line, "param:", 6)) continue;
+          if(!strncmp(line, "param:i-jpg:", 12)) continue;
+          if(dt_graph_read_config_line(&g_graph, line) == 0) applied++;
+        }
+        fclose(rf);
+        size_t n = 0; double ms = 0; unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all); free(b);
+        fprintf(stderr, "[srv] recipe restored: %d params\n", applied);
+      }
+    }
+  }
+  dt_graph_history_init(&g_graph);
+  dt_graph_history_reset(&g_graph);
+  g_history_base = g_graph.history_item_end;
+  build_menu_json();
+  return 0;
+}
+
 // persist the current edit as a vkdt .cfg sidecar next to the image. The recipe is
 // server-authoritative; the phone holds nothing canonical. (See wiki: Session, Recipe
 // & Library Model.) The written .cfg references the preview proxy as input — on load we
@@ -404,6 +494,28 @@ static void *autosave_thread(void *u)
   return NULL;
 }
 
+// HTTP POST /upload?name=foo.jpg — save the raw body into the library dir; returns the
+// stored basename. The client then sends a WS `open <name>` to switch to it.
+static int upload_handler(struct mg_connection *c, void *u)
+{
+  (void)u;
+  const struct mg_request_info *ri = mg_get_request_info(c);
+  char name[256] = "upload.jpg";
+  if(ri->query_string) mg_get_var(ri->query_string, strlen(ri->query_string), "name", name, sizeof(name));
+  char *bn = name; for(char *p = name; *p; p++) if(*p=='/' || *p=='\\') bn = p+1;  // basename only
+  if(!*bn || strstr(bn, "..")) bn = "upload.jpg";
+  char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_libdir, bn);
+  FILE *f = fopen(path, "wb");
+  if(!f) { mg_printf(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); return 500; }
+  char buf[1<<16]; int n; long long total = 0;
+  while((n = mg_read(c, buf, sizeof(buf))) > 0) { fwrite(buf, 1, n, f); total += n; }
+  fclose(f);
+  fprintf(stderr, "[srv] upload %s (%lld B)\n", path, total);
+  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\n"
+               "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(bn), bn);
+  return 200;
+}
+
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char *argv[])
@@ -418,79 +530,10 @@ int main(int argc, char *argv[])
   threads_global_init();
   if(qvk_init(0, -1, 0, 0, 0)) { fprintf(stderr, "[srv] qvk_init failed\n"); return 1; }
 
-  dt_graph_init(&g_graph, s_queue_compute);
-  snprintf(g_graph.searchpath, sizeof(g_graph.searchpath), ".");
-
-  dt_graph_export_t param = {0};
-  param.p_cfgfile  = cfg;
-  param.output_cnt = 1;
-  param.output[0].inst             = dt_token("main");
-  param.output[0].mod              = dt_token("o-jpg");
-  param.output[0].p_filename       = g_jpgbase;
-  param.output[0].quality          = 90;
-  param.output[0].colour_primaries = s_colour_primaries_srgb;
-  param.output[0].colour_trc       = s_colour_trc_srgb;
-  param.output[0].max_width        = 1280;
-  param.output[0].max_height       = 1280;
-
-  // preview proxy: full-res source would be re-decoded each frame (~400ms/12MP).
-  // edit a downscaled proxy; full-res is only for export (M5). TODO keep source resident.
-  if(image) snprintf(g_recipe_path, sizeof(g_recipe_path), "%s.cfg", image);  // recipe sidecar
-
-  const char *use_image = image;
-  char proxypath[1024];
-  if(image)
-  {
-    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
-    if(make_proxy(image, proxypath, 1600) == 0 && access(proxypath, R_OK) == 0)
-    { use_image = proxypath; fprintf(stderr, "[srv] preview proxy %s <- %s\n", proxypath, image); }
-    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow)\n", image);
-  }
-  char imgline[1024]; char *extra[1];
-  if(use_image)
-  {
-    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
-    extra[0] = imgline;
-    param.extra_param_cnt = 1;
-    param.p_extra_param   = extra;
-  }
-  if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
-  { fprintf(stderr, "[srv] graph setup failed for '%s'\n", cfg); return 1; }
-
-  snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
-
-  // restore a previously saved recipe: overlay its param: lines onto the template
-  // pipeline (structure stays from cfg; only edits are restored). Skip the i-jpg input
-  // (server-managed via the proxy). Server is now authoritative for the edit state.
-  if(g_recipe_path[0] && access(g_recipe_path, R_OK) == 0)
-  {
-    FILE *rf = fopen(g_recipe_path, "r");
-    if(rf)
-    {
-      char line[4096]; int applied = 0;
-      while(fgets(line, sizeof(line), rf))
-      {
-        line[strcspn(line, "\r\n")] = 0;
-        if(strncmp(line, "param:", 6)) continue;
-        if(!strncmp(line, "param:i-jpg:", 12)) continue;
-        if(dt_graph_read_config_line(&g_graph, line) == 0) applied++;
-      }
-      fclose(rf);
-      size_t n = 0; double ms = 0;
-      unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all);  // commit overlaid params
-      free(b);
-      fprintf(stderr, "[srv] recipe restored: %d params from %s\n", applied, g_recipe_path);
-    }
-  }
-
-  // history: baseline-snapshot the current (recipe-restored) state. user edits append
-  // after g_history_base; undo/jump operate within the session; reset goes to defaults.
-  dt_graph_history_init(&g_graph);
-  dt_graph_history_reset(&g_graph);
-  g_history_base = g_graph.history_item_end;
-
-  build_menu_json();
-  fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B\n", g_jpgpath, strlen(g_menu_json));
+  g_cfg = cfg;
+  mkdir(g_libdir, 0755);                 // library / upload directory (relative to cwd)
+  if(open_image(image)) { fprintf(stderr, "[srv] initial open failed\n"); return 1; }
+  fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B  libdir=%s\n", g_jpgpath, strlen(g_menu_json), g_libdir);
 
   signal(SIGINT, on_sigint);
   mg_init_library(0);
@@ -508,6 +551,7 @@ int main(int argc, char *argv[])
   struct mg_context *ctx = mg_start(&cb, NULL, opts);
   if(!ctx) { fprintf(stderr, "[srv] mg_start failed (port %s)\n", port); return 1; }
   mg_set_websocket_handler(ctx, "/ws", ws_connect, ws_ready, ws_data, ws_close, NULL);
+  mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
