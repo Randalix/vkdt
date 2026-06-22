@@ -214,6 +214,7 @@ int main(int argc, char *argv[])
   const char *docroot = argc > 1 ? argv[1] : "../web";
   const char *port    = argc > 2 ? argv[2] : "8090";
   const char *cfg     = argc > 3 ? argv[3] : "examples/m3.cfg";
+  const char *image   = argc > 4 ? argv[4] : NULL; // override i-jpg:main filename
 
   dt_log_init(s_log_cli);
   dt_pipe_global_init();
@@ -232,6 +233,16 @@ int main(int argc, char *argv[])
   param.output[0].quality          = 90;
   param.output[0].colour_primaries = s_colour_primaries_srgb;
   param.output[0].colour_trc       = s_colour_trc_srgb;
+  param.output[0].max_width        = 1280;   // cap preview resolution for mobile
+  param.output[0].max_height       = 1280;
+  char imgline[1024]; char *extra[1];
+  if(image)
+  { // inject the input image before the graph runs (extra params apply post display-replace)
+    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", image);
+    extra[0] = imgline;
+    param.extra_param_cnt = 1;
+    param.p_extra_param   = extra;
+  }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
   { fprintf(stderr, "[srv] graph setup failed for '%s'\n", cfg); return 1; }
 
