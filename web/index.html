@@ -107,12 +107,12 @@ const R =()=>Math.min(innerWidth,innerHeight)*0.34, R0=()=>R()*0.4;
 const RT32=0.8660254, INV_RT3=0.5773503, CH_SENS=0.4;  // colour-wheel mapping (matches vkdt); low sensitivity
 
 // ---- colour wheel (2D chroma trackball + master), mirrors vkdt's colwheel ----
-let whItem=null, whGI=-1, whPI=-1, whDrag=null, whLX=0, whLY=0;
+let whItem=null, whGI=-1, whPI=-1, whDrag=null, whLX=0, whLY=0, whMoved=false;
 const WCX=()=>innerWidth/2, WCY=()=>innerHeight*0.40, WR=()=>Math.min(innerWidth,innerHeight)*0.28;
 function enterWheel(gi,pi){ whGI=gi; whPI=pi; whItem=groups[gi].items[pi];
   if(!Array.isArray(whItem.cur)) whItem.cur=[...(whItem.def||[0,0,0,0])];
   whDrag=null; state=ST.WHEEL; markActive(gi,pi); drawOverlay();
-  hud.textContent=`${whItem.label} — drag wheel = colour · bar = master`; }
+  hud.textContent=`${whItem.label} — drag anywhere = colour · bar = master · tap = close`; }
 function wheelChroma(dx,dy){ const it=whItem, def=it.def, cur=it.cur;
   const sx=dx/(WR()*2)*CH_SENS, sy=dy/(WR()*2)*CH_SENS;
   let disp=[cur[0]-def[0], cur[1]-def[1], cur[2]-def[2]];
@@ -156,7 +156,7 @@ function drawOverlay(){
     octx.strokeStyle='#bbb'; octx.beginPath(); octx.moveTo(mx,my); octx.lineTo(mx+mw*frac,my); octx.stroke();
     octx.fillStyle='#fff'; octx.textAlign='center'; octx.textBaseline='alphabetic'; octx.shadowColor='#000'; octx.shadowBlur=4;
     octx.font='600 18px system-ui'; octx.fillText(it.label, ccx, ccy-r-14);
-    octx.font='12px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag wheel = colour · bar = master', ccx, my+26);
+    octx.font='12px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag anywhere · bar = master · tap to close', ccx, my+26);
     octx.shadowBlur=0; return;
   }
   if(state===ST.VALUE){
@@ -209,12 +209,10 @@ ovr.addEventListener('pointerdown', e=>{
   if(blockRadial) return;
   const p=pos(e);
   if(state===ST.WHEEL){
-    const dxc=p.x-WCX(), dyc=p.y-WCY(), inWheel=(dxc*dxc+dyc*dyc)<=(WR()*1.15)**2;
     const my=WCY()+WR()+26, mw=WR()*1.6, mx=WCX()-mw/2;
     const inMaster=(p.x>=mx-14 && p.x<=mx+mw+14 && Math.abs(p.y-my)<28);
-    if(inWheel){ whDrag='chroma'; whLX=p.x; whLY=p.y; }
-    else if(inMaster){ whDrag='master'; whLX=p.x; whLY=p.y; }
-    else { state=ST.IDLE; whDrag=null; markActive(-1); hud.textContent='hold or tap'; drawOverlay(); }
+    whDrag = inMaster ? 'master' : 'chroma';   // chroma drags from ANYWHERE; master = bottom strip
+    whLX=p.x; whLY=p.y; whMoved=false;
     return;
   }
   if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; return; }
@@ -226,7 +224,7 @@ ovr.addEventListener('pointermove', e=>{
   if(blockRadial || state===ST.IDLE) return;
   const p=pos(e);
   if(state===ST.WHEEL){
-    if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y;
+    if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y; whMoved=true;
       if(whDrag==='chroma') wheelChroma(dx,dy); else wheelMaster(dx); drawOverlay(); }
     return;
   }
@@ -247,7 +245,10 @@ function endPointer(e){
   if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
   else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
   else if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI); state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
-  else if(state===ST.WHEEL){ if(whDrag) bumpUsage(whGI,whPI); whDrag=null; } // stay in wheel for more strokes
+  else if(state===ST.WHEEL){
+    if(whMoved){ bumpUsage(whGI,whPI); whDrag=null; }                               // a stroke — stay in the wheel
+    else { whDrag=null; state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; } // a tap — close
+  }
   drawOverlay();
 }
 ovr.addEventListener('pointerup', endPointer);
