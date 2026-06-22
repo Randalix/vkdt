@@ -104,7 +104,7 @@ const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3, WHEEL:4 };
 let state=ST.IDLE, cx=0, cy=0, curGroup=-1, hover=-1;
 let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1, scrubbing=false;
 const R =()=>Math.min(innerWidth,innerHeight)*0.34, R0=()=>R()*0.4;
-const RT32=0.8660254, INV_RT3=0.5773503, CH_SENS=1.2;  // colour-wheel mapping (matches vkdt)
+const RT32=0.8660254, INV_RT3=0.5773503, CH_SENS=0.4;  // colour-wheel mapping (matches vkdt); low sensitivity
 
 // ---- colour wheel (2D chroma trackball + master), mirrors vkdt's colwheel ----
 let whItem=null, whGI=-1, whPI=-1, whDrag=null, whLX=0, whLY=0;
@@ -140,11 +140,11 @@ function drawOverlay(){
   if(state===ST.IDLE) return;
   if(state===ST.WHEEL){
     const it=whItem, ccx=WCX(), ccy=WCY(), r=WR(), def=it.def, cur=it.cur;
-    for(let i=0;i<48;i++){ const a0=2*Math.PI*i/48, a1=2*Math.PI*(i+1)/48+0.01, h=-(a0+a1)/2-Math.PI/2;
-      octx.beginPath(); octx.moveTo(ccx,ccy); octx.arc(ccx,ccy,r,a0,a1); octx.closePath();
+    const rIn=r*0.88;  // thin ring only — never fill the centre, image stays visible
+    for(let i=0;i<48;i++){ const a0=2*Math.PI*i/48, a1=2*Math.PI*(i+1)/48+0.012, h=-(a0+a1)/2-Math.PI/2;
+      octx.beginPath(); octx.arc(ccx,ccy,r,a0,a1); octx.arc(ccx,ccy,rIn,a1,a0,true); octx.closePath();
       octx.fillStyle=`rgb(${(0.5+0.5*Math.cos(h))*255|0},${(0.5+0.5*Math.cos(h-2.0944))*255|0},${(0.5+0.5*Math.cos(h+2.0944))*255|0})`;
       octx.fill(); }
-    octx.beginPath(); octx.arc(ccx,ccy,r*0.80,0,7); octx.fillStyle='rgba(18,18,22,.92)'; octx.fill();
     const disp=[cur[0]-def[0],cur[1]-def[1],cur[2]-def[2]];
     const wx=disp[2]-disp[1], wy=(-disp[0]+0.5*(disp[1]+disp[2]))/RT32, px=ccx+wx*r, py=ccy+wy*r;
     octx.strokeStyle='rgba(150,150,150,.5)'; octx.lineWidth=1;
@@ -176,7 +176,7 @@ function drawOverlay(){
     const a0=i*seg-Math.PI, a1=a0+seg, mid=a0+seg/2;
     octx.beginPath(); octx.moveTo(cx+Math.cos(a0)*R0(), cy+Math.sin(a0)*R0());
     octx.arc(cx,cy,r,a0,a1); octx.arc(cx,cy,R0(),a1,a0,true); octx.closePath();
-    octx.fillStyle=(i===hover)?'rgba(80,150,230,.92)':'rgba(24,26,32,.82)'; octx.fill();
+    octx.fillStyle=(i===hover)?'rgba(80,150,230,.85)':'rgba(18,20,26,.45)'; octx.fill();
     octx.strokeStyle='rgba(255,255,255,.14)'; octx.lineWidth=1; octx.stroke();
     octx.fillStyle=(i===hover)?'#fff':'#cdd'; octx.textAlign='center'; octx.textBaseline='middle';
     octx.font=(i===hover?'600 ':'')+'13px system-ui';
