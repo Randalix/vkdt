@@ -42,6 +42,7 @@ static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
 static volatile int    g_dirty = 0;           // edits pending an autosave
+static void recipe_save(void);
 
 static inline double now_ms()
 {
