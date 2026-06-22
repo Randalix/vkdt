@@ -151,6 +151,7 @@ int main(int argc, char *argv[])
     "listening_ports", port,
     "num_threads",     "4",
     "enable_directory_listing", "no",
+    "tcp_nodelay",     "1",   // disable Nagle: small WS frames must not stall ~40ms on delayed-ACK
     NULL
   };
   struct mg_callbacks cb; memset(&cb, 0, sizeof(cb));
