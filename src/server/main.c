@@ -105,6 +105,8 @@ static void build_menu_json(void)
   {
     dt_module_so_t *so = g_graph.module[m].so;
     if(!so) continue;
+    const char *nm = dt_token_str(g_graph.module[m].name);
+    if(nm[0] && nm[1]=='-' && (nm[0]=='i' || nm[0]=='o')) continue; // skip input/output modules
     int has = 0;
     for(int pi = 0; pi < so->num_params; pi++) if(is_radial_slider(so->param[pi])) { has = 1; break; }
     if(!has) continue;
