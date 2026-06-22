@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <jpeglib.h>
 
 static dt_graph_t      g_graph;
@@ -50,9 +51,19 @@ static FILE           *g_logf = NULL;         // optional logfile (config: logfi
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
-  char port[16], docroot[512], cfg[512], image[1024], libdir[512], logfile[512];
+  char port[16], docroot[512], cfg[512], cfg_raw[512], image[1024], libdir[512], logfile[512];
   int  proxy_max, preview_max, quality;
-} g_conf = { "8090", "../web", "examples/m3.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90 };
+} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90 };
+
+// raw photo extensions -> use the i-raw pipeline (no jpeg proxy; vkdt decodes the raw)
+static int is_raw_path(const char *p)
+{
+  const char *dot = strrchr(p, '.'); if(!dot) return 0;
+  char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
+  static const char *raw[] = { "dng","cr2","cr3","nef","arw","raf","rw2","orf","pef","srw","raw","3fr","iiq","nrw","mrw", NULL };
+  for(int k = 0; raw[k]; k++) if(!strcmp(e, raw[k])) return 1;
+  return 0;
+}
 
 static void recipe_save(void);
 static int  open_image(const char *image);    // (re)build the warm graph for an image
@@ -82,6 +93,7 @@ static void load_config(const char *path)
     if     (!strcmp(k,"port"))        snprintf(g_conf.port,    sizeof(g_conf.port),    "%s", v);
     else if(!strcmp(k,"docroot"))     snprintf(g_conf.docroot, sizeof(g_conf.docroot), "%s", v);
     else if(!strcmp(k,"cfg"))         snprintf(g_conf.cfg,     sizeof(g_conf.cfg),     "%s", v);
+    else if(!strcmp(k,"cfg_raw"))     snprintf(g_conf.cfg_raw, sizeof(g_conf.cfg_raw), "%s", v);
     else if(!strcmp(k,"image"))       snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", v);
     else if(!strcmp(k,"libdir"))      snprintf(g_conf.libdir,  sizeof(g_conf.libdir),  "%s", v);
     else if(!strcmp(k,"logfile"))     snprintf(g_conf.logfile, sizeof(g_conf.logfile), "%s", v);
@@ -459,17 +471,22 @@ static int make_proxy(const char *in, const char *out, int maxdim)
 // g_lock held when re-opening at runtime.
 static int open_image(const char *image)
 {
-  // decode the image to a preview proxy BEFORE touching the live graph, so a bad or
-  // unsupported file (HEIC, corrupt, wrong format) leaves the current session intact
-  // instead of tearing the graph down into a broken state.
+  // pick pipeline + input by file type: raw -> i-raw graph, fed the ORIGINAL file (vkdt
+  // decodes/demosaics it; only the streamed preview is jpeg). jpeg -> i-jpg graph + a
+  // small preview proxy. The proxy/decode runs BEFORE the graph teardown, so a bad file
+  // leaves the current session intact.
+  const int raw = image && is_raw_path(image);
+  const char *cfg = raw ? g_conf.cfg_raw : g_conf.cfg;
+  const char *inmod = raw ? "i-raw" : "i-jpg";
   char proxypath[1024] = ""; const char *use_image = image;
-  if(image)
+  if(image && !raw)
   {
     snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
     if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
     { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
     else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
   }
+  else if(raw) lg("srv", "raw input <- %s", image);
 
   static int built = 0;
   if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
@@ -478,7 +495,7 @@ static int open_image(const char *image)
   built = 1;
 
   dt_graph_export_t param = {0};
-  param.p_cfgfile  = g_conf.cfg;
+  param.p_cfgfile  = cfg;
   param.output_cnt = 1;
   param.output[0].inst             = dt_token("main");
   param.output[0].mod              = dt_token("o-jpg");
@@ -492,11 +509,11 @@ static int open_image(const char *image)
   char imgline[1280]; char *extra[1];
   if(image)
   {
-    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
+    snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", inmod, use_image);
     extra[0] = imgline; param.extra_param_cnt = 1; param.p_extra_param = extra;
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
-  { lg("err", "graph export failed for '%s'", g_conf.cfg); return 1; }
+  { lg("err", "graph export failed for '%s'", cfg); return 1; }
   snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
 
   // restore this image's recipe (param overlay onto the template; skip i-jpg input)
@@ -514,7 +531,7 @@ static int open_image(const char *image)
         {
           line[strcspn(line, "\r\n")] = 0;
           if(strncmp(line, "param:", 6)) continue;
-          if(!strncmp(line, "param:i-jpg:", 12)) continue;
+          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12)) continue;  // server-managed input
           if(dt_graph_read_config_line(&g_graph, line) == 0) applied++;
         }
         fclose(rf);
