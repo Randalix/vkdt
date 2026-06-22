@@ -16,6 +16,7 @@
 #include "qvk/qvk.h"
 #include "pipe/graph.h"
 #include "pipe/graph-io.h"
+#include "pipe/graph-history.h"
 #include "pipe/graph-export.h"
 #include "pipe/global.h"
 #include "pipe/params.h"
@@ -42,6 +43,7 @@ static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
 static volatile int    g_dirty = 0;           // edits pending an autosave
+static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
 static void recipe_save(void);
 
 static inline double now_ms()
@@ -188,6 +190,47 @@ static void build_menu_json(void)
   o += snprintf(o, e-o, "]}");
 }
 
+// send the user-facing history stack (edits after the baseline snapshot) as JSON.
+// each item carries its absolute index (for `jump`) and a short label parsed from the
+// stored config line "param:<module>:<inst>:<name>:<value...>".
+static void send_history(struct mg_connection *c)
+{
+  static char buf[16384];
+  char *o = buf, *e = buf + sizeof(buf);
+  pthread_mutex_lock(&g_lock);
+  o += snprintf(o, e-o, "{\"type\":\"history\",\"cur\":%u,\"base\":%u,\"items\":[",
+      g_graph.history_item_cur, g_history_base);
+  int first = 1;
+  for(uint32_t i = g_history_base; i < g_graph.history_item_end; i++)
+  {
+    char tmp[256]; strncpy(tmp, g_graph.history_item[i], sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
+    char *save = 0;
+    strtok_r(tmp, ":", &save);                 // "param"
+    char *mod = strtok_r(0, ":", &save);       // module
+    strtok_r(0, ":", &save);                   // inst
+    char *nam = strtok_r(0, ":", &save);       // param name
+    char *val = save ? save : "";              // value (may contain ':')
+    char label[160];
+    snprintf(label, sizeof(label), "%s · %s %.40s", mod?mod:"", nam?nam:"", val);
+    if(!first) o += snprintf(o, e-o, ","); first = 0;
+    o += snprintf(o, e-o, "{\"i\":%u,\"label\":\"%s\"}", i, label);
+  }
+  o += snprintf(o, e-o, "]}");
+  pthread_mutex_unlock(&g_lock);
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
+}
+
+// after a history op (undo/redo/jump/reset) the whole edit state changed: re-render,
+// re-send the dynamic menu (so the client's param values stay in sync) and the history.
+static void after_graph_change(struct mg_connection *c)
+{
+  push_frame(c, s_graph_run_all);
+  pthread_mutex_lock(&g_lock); build_menu_json(); pthread_mutex_unlock(&g_lock);
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, g_menu_json, strlen(g_menu_json));
+  send_history(c);
+  g_dirty = 1;
+}
+
 static int  ws_connect(const struct mg_connection *c, void *u) { (void)c; (void)u; return 0; }
 static void ws_close  (const struct mg_connection *c, void *u) { (void)c; (void)u; }
 
@@ -207,6 +250,50 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
 
   if(!strncmp(tmp, "save", 4)) { recipe_save(); return 1; }  // explicit save (autosave also runs)
 
+  if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
+  if(!strncmp(tmp, "undo", 4))
+  {
+    pthread_mutex_lock(&g_lock);
+    if(g_graph.history_item_cur > g_history_base) dt_graph_history_set(&g_graph, g_graph.history_item_cur - 2);
+    pthread_mutex_unlock(&g_lock);
+    after_graph_change(c); return 1;
+  }
+  if(!strncmp(tmp, "redo", 4))
+  {
+    pthread_mutex_lock(&g_lock);
+    if(g_graph.history_item_cur < g_graph.history_item_end) dt_graph_history_set(&g_graph, g_graph.history_item_cur);
+    pthread_mutex_unlock(&g_lock);
+    after_graph_change(c); return 1;
+  }
+  { int hi;
+    if(sscanf(tmp, "jump %d", &hi) == 1)
+    {
+      pthread_mutex_lock(&g_lock);
+      if(hi >= (int)g_history_base - 1 && hi < (int)g_graph.history_item_end) dt_graph_history_set(&g_graph, hi);
+      pthread_mutex_unlock(&g_lock);
+      after_graph_change(c); return 1;
+    }
+  }
+  if(!strncmp(tmp, "reset", 5))
+  { // back to default: reset all editable modules' params, keep i-/o- (input/output) intact
+    pthread_mutex_lock(&g_lock);
+    for(int m = 0; m < g_graph.num_modules; m++)
+    {
+      dt_module_so_t *so = g_graph.module[m].so; if(!so) continue;
+      const char *nm = dt_token_str(g_graph.module[m].name);
+      if(nm[0] && nm[1]=='-' && (nm[0]=='i' || nm[0]=='o')) continue;
+      for(int p = 0; p < so->num_params; p++)
+      {
+        const dt_ui_param_t *pp = so->param[p];
+        memcpy(g_graph.module[m].param + pp->offset, pp->val, dt_ui_param_size(pp->type, pp->cnt));
+      }
+    }
+    dt_graph_history_reset(&g_graph);
+    g_history_base = g_graph.history_item_end;
+    pthread_mutex_unlock(&g_lock);
+    after_graph_change(c); return 1;
+  }
+
   int modid, parid; float v;
   if(sscanf(tmp, "P %d %d %f", &modid, &parid, &v) == 3 &&
      modid >= 0 && modid < g_graph.num_modules)
@@ -219,6 +306,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old);
     g_graph.active_module = modid;
+    dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
     unsigned char *b = render_to_jpeg(&n, &ms, fl);
     pthread_mutex_unlock(&g_lock);
@@ -246,6 +334,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old0);
     g_graph.active_module = modid;
+    dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
     unsigned char *b = render_to_jpeg(&n, &ms, fl);
     pthread_mutex_unlock(&g_lock);
@@ -394,6 +483,12 @@ int main(int argc, char *argv[])
     }
   }
 
+  // history: baseline-snapshot the current (recipe-restored) state. user edits append
+  // after g_history_base; undo/jump operate within the session; reset goes to defaults.
+  dt_graph_history_init(&g_graph);
+  dt_graph_history_reset(&g_graph);
+  g_history_base = g_graph.history_item_end;
+
   build_menu_json();
   fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B\n", g_jpgpath, strlen(g_menu_json));
 
@@ -424,6 +519,7 @@ int main(int argc, char *argv[])
   if(g_dirty) recipe_save();  // flush any pending edit
   mg_stop(ctx);
   mg_exit_library();
+  dt_graph_history_cleanup(&g_graph);
   dt_graph_cleanup(&g_graph);
   threads_global_cleanup();
   qvk_cleanup();
