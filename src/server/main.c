@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <jpeglib.h>
 
 static dt_graph_t      g_graph;
@@ -45,10 +46,51 @@ static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
 static volatile int    g_dirty = 0;           // edits pending an autosave
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
-static const char     *g_cfg = "examples/m3.cfg";  // template pipeline
-static char            g_libdir[512] = "uploads";  // where uploaded/library images live
+static FILE           *g_logf = NULL;         // optional logfile (config: logfile=)
+
+// all server settings live here; loaded from a config file (key=value), CLI args override.
+static struct {
+  char port[16], docroot[512], cfg[512], image[1024], libdir[512], logfile[512];
+  int  proxy_max, preview_max, quality;
+} g_conf = { "8090", "../web", "examples/m3.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90 };
+
 static void recipe_save(void);
 static int  open_image(const char *image);    // (re)build the warm graph for an image
+
+// timestamped log to stderr + the configured logfile. tag groups the source (srv/cli/err).
+static void lg(const char *tag, const char *fmt, ...)
+{
+  char ts[16]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+  strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+  char msg[1024]; va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+  fprintf(stderr, "[%s] %-3s %s\n", ts, tag, msg); fflush(stderr);
+  if(g_logf) { fprintf(g_logf, "[%s] %-3s %s\n", ts, tag, msg); fflush(g_logf); }
+}
+
+static void load_config(const char *path)
+{
+  FILE *f = fopen(path, "r"); if(!f) return;
+  char line[1280];
+  while(fgets(line, sizeof(line), f))
+  {
+    line[strcspn(line, "\r\n")] = 0;
+    char *k = line; while(*k==' '||*k=='\t') k++;
+    if(*k=='#' || !*k) continue;
+    char *eq = strchr(k, '='); if(!eq) continue;
+    *eq = 0; char *v = eq+1; while(*v==' '||*v=='\t') v++;
+    char *ke = eq; while(ke>k && (ke[-1]==' '||ke[-1]=='\t')) *--ke = 0;
+    if     (!strcmp(k,"port"))        snprintf(g_conf.port,    sizeof(g_conf.port),    "%s", v);
+    else if(!strcmp(k,"docroot"))     snprintf(g_conf.docroot, sizeof(g_conf.docroot), "%s", v);
+    else if(!strcmp(k,"cfg"))         snprintf(g_conf.cfg,     sizeof(g_conf.cfg),     "%s", v);
+    else if(!strcmp(k,"image"))       snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", v);
+    else if(!strcmp(k,"libdir"))      snprintf(g_conf.libdir,  sizeof(g_conf.libdir),  "%s", v);
+    else if(!strcmp(k,"logfile"))     snprintf(g_conf.logfile, sizeof(g_conf.logfile), "%s", v);
+    else if(!strcmp(k,"proxy_max"))   g_conf.proxy_max   = atoi(v);
+    else if(!strcmp(k,"preview_max")) g_conf.preview_max = atoi(v);
+    else if(!strcmp(k,"quality"))     g_conf.quality     = atoi(v);
+  }
+  fclose(f);
+}
 
 static inline double now_ms()
 {
@@ -253,6 +295,9 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   memcpy(tmp, data, k); tmp[k] = 0;
 
   if(!strncmp(tmp, "save", 4)) { recipe_save(); return 1; }  // explicit save (autosave also runs)
+  if(!strncmp(tmp, "log ", 4))  // client-forwarded console/error message (may exceed tmp)
+  { char m[1024]; size_t z = len > 4 ? len - 4 : 0; if(z >= sizeof(m)) z = sizeof(m)-1;
+    memcpy(m, data+4, z); m[z] = 0; lg("cli", "%s", m); return 1; }
 
   if(!strncmp(tmp, "open ", 5))
   { // switch to a library image: flush current edits, rebuild graph, resync client
@@ -261,11 +306,13 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     if(*bn && !strstr(bn, ".."))
     {
       if(g_dirty) recipe_save();
-      char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_libdir, bn);
+      char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
+      lg("srv", "open %s", path);
       pthread_mutex_lock(&g_lock);
       int err = open_image(path);
       pthread_mutex_unlock(&g_lock);
-      if(!err) { after_graph_change(c); g_dirty = 0; }  // freshly opened: not dirty
+      if(err) lg("err", "open failed: %s", path);
+      else { after_graph_change(c); g_dirty = 0; }  // freshly opened: not dirty
     }
     return 1;
   }
@@ -325,6 +372,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     float old = *val; *val = v;
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old);
+    if(is_straight(p)) fl |= s_graph_run_all;  // rotate changes ROI -> needs modify_roi re-run
     g_graph.active_module = modid;
     dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
@@ -353,6 +401,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     for(int i=0;i<4;i++) val[i] = w[i];
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old0);
+    if(is_crop(p)) fl |= s_graph_run_all;  // crop changes ROI -> needs modify_roi re-run
     g_graph.active_module = modid;
     dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
@@ -417,30 +466,30 @@ static int open_image(const char *image)
   built = 1;
 
   dt_graph_export_t param = {0};
-  param.p_cfgfile  = g_cfg;
+  param.p_cfgfile  = g_conf.cfg;
   param.output_cnt = 1;
   param.output[0].inst             = dt_token("main");
   param.output[0].mod              = dt_token("o-jpg");
   param.output[0].p_filename       = g_jpgbase;
-  param.output[0].quality          = 90;
+  param.output[0].quality          = g_conf.quality;
   param.output[0].colour_primaries = s_colour_primaries_srgb;
   param.output[0].colour_trc       = s_colour_trc_srgb;
-  param.output[0].max_width        = 1280;
-  param.output[0].max_height       = 1280;
+  param.output[0].max_width        = g_conf.preview_max;
+  param.output[0].max_height       = g_conf.preview_max;
 
   const char *use_image = image;
   char proxypath[1024], imgline[1280]; char *extra[1];
   if(image)
   {
     snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
-    if(make_proxy(image, proxypath, 1600) == 0 && access(proxypath, R_OK) == 0)
-    { use_image = proxypath; fprintf(stderr, "[srv] preview proxy <- %s\n", image); }
-    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow)\n", image);
+    if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
+    { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
+    else lg("err", "proxy failed for %s (full-res, slow)", image);
     snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
     extra[0] = imgline; param.extra_param_cnt = 1; param.p_extra_param = extra;
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
-  { fprintf(stderr, "[srv] graph setup failed for '%s'\n", g_cfg); return 1; }
+  { lg("err", "graph setup failed for '%s'", g_conf.cfg); return 1; }
   snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
 
   // restore this image's recipe (param overlay onto the template; skip i-jpg input)
@@ -463,7 +512,7 @@ static int open_image(const char *image)
         }
         fclose(rf);
         size_t n = 0; double ms = 0; unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all); free(b);
-        fprintf(stderr, "[srv] recipe restored: %d params\n", applied);
+        lg("srv", "recipe restored: %d params from %s", applied, g_recipe_path);
       }
     }
   }
@@ -484,7 +533,7 @@ static void recipe_save(void)
   pthread_mutex_lock(&g_lock);
   int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
   pthread_mutex_unlock(&g_lock);
-  fprintf(stderr, "[srv] recipe %s\n", err ? "WRITE FAILED" : "saved");
+  lg(err ? "err" : "srv", "recipe %s -> %s", err ? "WRITE FAILED" : "saved", g_recipe_path);
 }
 // debounced autosave: write at most every ~2s while there are pending edits.
 static void *autosave_thread(void *u)
@@ -504,13 +553,13 @@ static int upload_handler(struct mg_connection *c, void *u)
   if(ri->query_string) mg_get_var(ri->query_string, strlen(ri->query_string), "name", name, sizeof(name));
   char *bn = name; for(char *p = name; *p; p++) if(*p=='/' || *p=='\\') bn = p+1;  // basename only
   if(!*bn || strstr(bn, "..")) bn = "upload.jpg";
-  char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_libdir, bn);
+  char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
   FILE *f = fopen(path, "wb");
-  if(!f) { mg_printf(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); return 500; }
+  if(!f) { lg("err", "upload: cannot open %s", path); mg_printf(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); return 500; }
   char buf[1<<16]; int n; long long total = 0;
   while((n = mg_read(c, buf, sizeof(buf))) > 0) { fwrite(buf, 1, n, f); total += n; }
   fclose(f);
-  fprintf(stderr, "[srv] upload %s (%lld B)\n", path, total);
+  lg("srv", "upload %s (%lld B)", path, total);
   mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\n"
                "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(bn), bn);
   return 200;
@@ -520,26 +569,34 @@ static void on_sigint(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char *argv[])
 {
-  const char *docroot = argc > 1 ? argv[1] : "../web";
-  const char *port    = argc > 2 ? argv[2] : "8090";
-  const char *cfg     = argc > 3 ? argv[3] : "examples/m3.cfg";
-  const char *image   = argc > 4 ? argv[4] : NULL;
+  // config: a single .conf path, else ./rabbit.conf with legacy positional overrides
+  // (docroot port cfg image) so existing launch scripts keep working.
+  if(argc == 2 && strstr(argv[1], ".conf")) load_config(argv[1]);
+  else
+  {
+    load_config("rabbit.conf");
+    if(argc > 1) snprintf(g_conf.docroot, sizeof(g_conf.docroot), "%s", argv[1]);
+    if(argc > 2) snprintf(g_conf.port,    sizeof(g_conf.port),    "%s", argv[2]);
+    if(argc > 3) snprintf(g_conf.cfg,     sizeof(g_conf.cfg),     "%s", argv[3]);
+    if(argc > 4) snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", argv[4]);
+  }
+  if(g_conf.logfile[0]) g_logf = fopen(g_conf.logfile, "a");
 
   dt_log_init(s_log_cli);
   dt_pipe_global_init();
   threads_global_init();
-  if(qvk_init(0, -1, 0, 0, 0)) { fprintf(stderr, "[srv] qvk_init failed\n"); return 1; }
+  if(qvk_init(0, -1, 0, 0, 0)) { lg("err", "qvk_init failed"); return 1; }
 
-  g_cfg = cfg;
-  mkdir(g_libdir, 0755);                 // library / upload directory (relative to cwd)
-  if(open_image(image)) { fprintf(stderr, "[srv] initial open failed\n"); return 1; }
-  fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B  libdir=%s\n", g_jpgpath, strlen(g_menu_json), g_libdir);
+  mkdir(g_conf.libdir, 0755);            // library / upload directory (relative to cwd)
+  const char *image = g_conf.image[0] ? g_conf.image : NULL;
+  if(open_image(image)) { lg("err", "initial open failed"); return 1; }
+  lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile);
 
   signal(SIGINT, on_sigint);
   mg_init_library(0);
   const char *opts[] = {
-    "document_root",   docroot,
-    "listening_ports", port,
+    "document_root",   g_conf.docroot,
+    "listening_ports", g_conf.port,
     "num_threads",     "4",
     "enable_directory_listing", "no",
     "tcp_nodelay",     "1",
@@ -549,16 +606,16 @@ int main(int argc, char *argv[])
   };
   struct mg_callbacks cb; memset(&cb, 0, sizeof(cb));
   struct mg_context *ctx = mg_start(&cb, NULL, opts);
-  if(!ctx) { fprintf(stderr, "[srv] mg_start failed (port %s)\n", port); return 1; }
+  if(!ctx) { lg("err", "mg_start failed (port %s)", g_conf.port); return 1; }
   mg_set_websocket_handler(ctx, "/ws", ws_connect, ws_ready, ws_data, ws_close, NULL);
   mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
-  fprintf(stderr, "[srv] listening on :%s  docroot=%s  (Ctrl-C to stop)\n", port, docroot);
+  lg("srv", "listening on :%s  docroot=%s  (Ctrl-C to stop)", g_conf.port, g_conf.docroot);
   while(!g_stop) sleep(1);
 
-  fprintf(stderr, "[srv] shutting down\n");
+  lg("srv", "shutting down");
   pthread_join(as, NULL);
   if(g_dirty) recipe_save();  // flush any pending edit
   mg_stop(ctx);
@@ -567,5 +624,6 @@ int main(int argc, char *argv[])
   dt_graph_cleanup(&g_graph);
   threads_global_cleanup();
   qvk_cleanup();
+  if(g_logf) fclose(g_logf);
   return 0;
 }
