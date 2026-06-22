@@ -146,14 +146,18 @@ function enterCrop(gi,pi){ crGI=gi; crPI=pi; cropItem=groups[gi].items[pi];
   crHandle=null; state=ST.CROP; markActive(gi,pi);
   sendCropVec(gi,pi,[0,1,0,1]);            // show the full uncropped image while editing
   drawOverlay(); hud.textContent='crop — drag corners/edges · tap = apply'; }
-function cropHandleAt(x,y){ const r=imgRect(), th=30;
-  const L=r.ix+cr[0]*r.iw, R=r.ix+cr[1]*r.iw, T=r.iy+cr[2]*r.ih, B=r.iy+cr[3]*r.ih, near=(a,b)=>Math.abs(a-b)<=th;
-  const nx=near(x,L)?'l':near(x,R)?'r':'', ny=near(y,T)?'t':near(y,B)?'b':'';
-  if(nx&&ny) return ny+nx;                       // corner e.g. 'tl'
-  if(nx && y>T-th && y<B+th) return nx;          // vertical edge
-  if(ny && x>L-th && x<R+th) return ny;          // horizontal edge
-  if(x>L&&x<R&&y>T&&y<B) return 'move';
-  return null; }
+function cropHandleAt(x,y){ const r=imgRect();
+  const L=r.ix+cr[0]*r.iw, R=r.ix+cr[1]*r.iw, T=r.iy+cr[2]*r.ih, B=r.iy+cr[3]*r.ih;
+  // big grab bands so corners/edges are reachable far from the screen edge (no need
+  // to touch the very edge). band ~30% of the rect, generous min, capped.
+  const cz=Math.min(140, Math.max(56, Math.min(R-L, B-T)*0.30)), M=44;
+  if(x<L-M||x>R+M||y<T-M||y>B+M) return null;          // well outside the rect → nothing
+  const xb = x < L+cz ? 'l' : x > R-cz ? 'r' : '';
+  const yb = y < T+cz ? 't' : y > B-cz ? 'b' : '';
+  if(xb&&yb) return yb+xb;                              // corner (large square zone)
+  if(xb) return xb;                                     // vertical edge band
+  if(yb) return yb;                                     // horizontal edge band
+  return 'move'; }
 function cropDrag(x,y,dx,dy){ const r=imgRect(), MIN=0.05, h=crHandle;
   const fx=v=>Math.max(0,Math.min(1,(v-r.ix)/r.iw)), fy=v=>Math.max(0,Math.min(1,(v-r.iy)/r.ih));
   if(h==='move'){ let ddx=Math.max(-cr[0],Math.min(1-cr[1],dx/r.iw)), ddy=Math.max(-cr[2],Math.min(1-cr[3],dy/r.ih));
