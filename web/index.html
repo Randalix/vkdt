@@ -78,8 +78,15 @@ function buildBar(){
 }
 function markActive(gi,pi){
   document.querySelectorAll('.btn.active').forEach(b=>b.classList.remove('active'));
-  if(gi>=0){ const b=bar.querySelector(`.btn[data-gi="${gi}"][data-pi="${pi}"]`); if(b){ b.classList.add('active');
-    b.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'}); } }
+  if(gi>=0){ const b=bar.querySelector(`.btn[data-gi="${gi}"][data-pi="${pi}"]`); if(b) b.classList.add('active'); }
+}
+// bar sorts by usage: most-recently-used button moves to the front
+let usage=[];
+function bumpUsage(gi,pi){ const k=gi+'-'+pi; usage=usage.filter(x=>x!==k); usage.unshift(k); reorderBar(); }
+function reorderBar(){
+  for(let i=usage.length-1;i>=0;i--){ const [g,p]=usage[i].split('-');
+    const b=bar.querySelector(`.btn[data-gi="${g}"][data-pi="${p}"]`); if(b) bar.prepend(b); }
+  bar.scrollTo({left:0, behavior:'smooth'});
 }
 
 // ---- shared value scrub (drag anywhere — no need to hit a slider) ----
@@ -148,7 +155,7 @@ ovr.addEventListener('pointerup', e=>{
   const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
   if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
   else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
-  else if(state===ST.VALUE){ scrubbing=false; state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
+  else if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI); state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
   drawOverlay();
 });
 
