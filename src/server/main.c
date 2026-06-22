@@ -235,10 +235,27 @@ int main(int argc, char *argv[])
   param.output[0].colour_trc       = s_colour_trc_srgb;
   param.output[0].max_width        = 1280;   // cap preview resolution for mobile
   param.output[0].max_height       = 1280;
-  char imgline[1024]; char *extra[1];
+  // preview proxy: the full-res source would be re-decoded each frame (~400ms for
+  // a 12MP jpeg). Edit a downscaled proxy instead (full-res is only for export,
+  // M5). Lightroom's "smart preview" pattern. TODO proper fix: keep source resident.
+  const char *use_image = image;
+  char proxypath[1024];
   if(image)
+  {
+    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
+    char cmd[2400];
+    snprintf(cmd, sizeof(cmd),
+        "python3 -c 'from PIL import Image; im=Image.open(\"%s\"); "
+        "im.thumbnail((1600,1600)); im.save(\"%s\",quality=92)' 2>/dev/null",
+        image, proxypath);
+    if(system(cmd) == 0 && access(proxypath, R_OK) == 0)
+    { use_image = proxypath; fprintf(stderr, "[srv] preview proxy %s <- %s\n", proxypath, image); }
+    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow re-decode per frame)\n", image);
+  }
+  char imgline[1024]; char *extra[1];
+  if(use_image)
   { // inject the input image before the graph runs (extra params apply post display-replace)
-    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", image);
+    snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
     extra[0] = imgline;
     param.extra_param_cnt = 1;
     param.p_extra_param   = extra;
