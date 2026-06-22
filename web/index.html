@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>rabbit_editor — M2</title>
+<title>rabbit_editor — M3.1</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#0d0d0f; color:#cfd2d6;
               font:14px/1.4 system-ui, sans-serif; -webkit-user-select:none; user-select:none; }
   #wrap { display:flex; flex-direction:column; height:100%; }
   #view { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; }
-  canvas { max-width:100%; max-height:100%; image-rendering:auto; }
+  canvas { max-width:100%; max-height:100%; }
   #panel { padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:#15151a; }
-  #panel label { display:flex; align-items:center; gap:10px; }
-  input[type=range] { flex:1; height:34px; touch-action:none; }
-  #stat { margin-top:8px; font-variant-numeric:tabular-nums; color:#8b9; min-height:1.4em; }
+  select,input[type=range] { width:100%; height:36px; margin:4px 0; box-sizing:border-box; }
+  input[type=range] { touch-action:none; }
+  #stat { margin-top:6px; font-variant-numeric:tabular-nums; color:#8b9; min-height:1.4em; }
   #stat.bad { color:#d77; }
 </style>
 </head>
@@ -22,20 +22,41 @@
 <div id="wrap">
   <div id="view"><canvas id="c"></canvas></div>
   <div id="panel">
-    <label>edges <input id="s" type="range" min="0" max="1" step="0.005" value="0.5"></label>
+    <select id="fav"></select>
+    <input id="s" type="range" min="0" max="1" step="0.001" value="0.5">
     <div id="stat">connecting…</div>
   </div>
 </div>
 <script>
 const c = document.getElementById('c'), ctx = c.getContext('2d', { alpha:false });
-const s = document.getElementById('s'), stat = document.getElementById('stat');
+const favSel = document.getElementById('fav'), s = document.getElementById('s'), stat = document.getElementById('stat');
 let ws, sentAt = 0, inFlight = false, queued = null, frames = 0, ema = 0;
+let favs = [];
+
+function curFav(){ return favs[favSel.value|0]; }
+function syncSlider(){
+  const f = curFav(); if(!f || f.kind !== 'param') return;
+  s.min = f.min; s.max = f.max; s.step = (f.max - f.min) / 1000 || 0.001; s.value = f.cur;
+}
 
 function draw(blob){
   return createImageBitmap(blob).then(bmp => {
     if(c.width !== bmp.width || c.height !== bmp.height){ c.width = bmp.width; c.height = bmp.height; }
     ctx.drawImage(bmp, 0, 0); bmp.close();
   });
+}
+
+function onState(st){
+  favs = st.favs || [];
+  favSel.innerHTML = '';
+  favs.forEach((f,i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = (f.kind === 'preset' ? '◆ ' : '') + f.label;
+    o.disabled = f.kind === 'preset'; // presets not wired yet (M3.3)
+    favSel.appendChild(o);
+  });
+  const firstParam = favs.findIndex(f => f.kind === 'param');
+  if(firstParam >= 0){ favSel.value = firstParam; syncSlider(); }
 }
 
 function connect(){
@@ -46,6 +67,7 @@ function connect(){
   ws.onclose = () => { stat.className='bad'; stat.textContent = 'disconnected — retrying…'; setTimeout(connect, 1000); };
   ws.onerror = () => ws.close();
   ws.onmessage = async (e) => {
+    if(typeof e.data === 'string'){ try { onState(JSON.parse(e.data)); } catch(_){} return; }
     const rtt = performance.now() - sentAt;
     await draw(e.data);
     ema = ema ? ema*0.8 + rtt*0.2 : rtt;
@@ -55,14 +77,17 @@ function connect(){
   };
 }
 
-// throttle: at most one render in flight; keep only the latest pending value.
+// throttle: one render in flight; keep only the latest pending value.
 function send(v){
+  const f = curFav(); if(!f || f.kind !== 'param') return;
   if(!ws || ws.readyState !== 1) return;
+  f.cur = +v;
   if(inFlight){ queued = v; return; }
   inFlight = true; sentAt = performance.now();
-  ws.send('edges=' + v);
+  ws.send(`P ${f.modid} ${f.parid} ${v}`);
 }
 
+favSel.addEventListener('change', syncSlider);
 s.addEventListener('input', () => send(s.value));
 connect();
 </script>
