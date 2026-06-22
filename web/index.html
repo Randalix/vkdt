@@ -2,93 +2,169 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>rabbit_editor — M3.1</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>rabbit_editor</title>
 <style>
   :root { color-scheme: dark; }
-  html,body { margin:0; height:100%; background:#0d0d0f; color:#cfd2d6;
-              font:14px/1.4 system-ui, sans-serif; -webkit-user-select:none; user-select:none; }
-  #wrap { display:flex; flex-direction:column; height:100%; }
-  #view { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; }
-  canvas { max-width:100%; max-height:100%; }
-  #panel { padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:#15151a; }
-  select,input[type=range] { width:100%; height:36px; margin:4px 0; box-sizing:border-box; }
-  input[type=range] { touch-action:none; }
-  #stat { margin-top:6px; font-variant-numeric:tabular-nums; color:#8b9; min-height:1.4em; }
-  #stat.bad { color:#d77; }
+  html,body { margin:0; height:100%; overflow:hidden; background:#0a0a0c; color:#e6e8ea;
+              font:14px/1.3 system-ui, sans-serif; -webkit-user-select:none; user-select:none;
+              -webkit-tap-highlight-color:transparent; }
+  #img, #menu { position:fixed; inset:0; width:100%; height:100%; }
+  #img  { object-fit:contain; background:#000; touch-action:none; }
+  #menu { touch-action:none; }
+  #hud  { position:fixed; left:0; right:0; bottom:0; padding:6px 10px calc(6px + env(safe-area-inset-bottom));
+          font-variant-numeric:tabular-nums; color:#7d8; text-align:center; pointer-events:none;
+          text-shadow:0 1px 3px #000; }
+  #hud.bad { color:#e88; }
 </style>
 </head>
 <body>
-<div id="wrap">
-  <div id="view"><canvas id="c"></canvas></div>
-  <div id="panel">
-    <select id="fav"></select>
-    <input id="s" type="range" min="0" max="1" step="0.001" value="0.5">
-    <div id="stat">connecting…</div>
-  </div>
-</div>
+<canvas id="img"></canvas>
+<canvas id="menu"></canvas>
+<div id="hud">connecting…</div>
 <script>
-const c = document.getElementById('c'), ctx = c.getContext('2d', { alpha:false });
-const favSel = document.getElementById('fav'), s = document.getElementById('s'), stat = document.getElementById('stat');
-let ws, sentAt = 0, inFlight = false, queued = null, frames = 0, ema = 0;
-let favs = [];
+"use strict";
+const imgC = document.getElementById('img'), ictx = imgC.getContext('2d', {alpha:false});
+const ovr  = document.getElementById('menu'), octx = ovr.getContext('2d');
+const hud  = document.getElementById('hud');
 
-function curFav(){ return favs[favSel.value|0]; }
-function syncSlider(){
-  const f = curFav(); if(!f || f.kind !== 'param') return;
-  s.min = f.min; s.max = f.max; s.step = (f.max - f.min) / 1000 || 0.001; s.value = f.cur;
-}
+let ws, sentAt = 0, inFlight = false, queued = null, ema = 0;
+let groups = [], presets = [];
 
-function draw(blob){
-  return createImageBitmap(blob).then(bmp => {
-    if(c.width !== bmp.width || c.height !== bmp.height){ c.width = bmp.width; c.height = bmp.height; }
-    ctx.drawImage(bmp, 0, 0); bmp.close();
-  });
-}
-
-function onState(st){
-  favs = st.favs || [];
-  favSel.innerHTML = '';
-  favs.forEach((f,i) => {
-    const o = document.createElement('option');
-    o.value = i; o.textContent = (f.kind === 'preset' ? '◆ ' : '') + f.label;
-    o.disabled = f.kind === 'preset'; // presets not wired yet (M3.3)
-    favSel.appendChild(o);
-  });
-  const firstParam = favs.findIndex(f => f.kind === 'param');
-  if(firstParam >= 0){ favSel.value = firstParam; syncSlider(); }
-}
-
+// ---- websocket ----
 function connect(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = 'blob';
-  ws.onopen  = () => { stat.className=''; stat.textContent = 'connected'; };
-  ws.onclose = () => { stat.className='bad'; stat.textContent = 'disconnected — retrying…'; setTimeout(connect, 1000); };
+  ws.onopen  = () => { hud.className=''; hud.textContent = 'hold to edit'; };
+  ws.onclose = () => { hud.className='bad'; hud.textContent = 'reconnecting…'; setTimeout(connect, 1000); };
   ws.onerror = () => ws.close();
   ws.onmessage = async (e) => {
-    if(typeof e.data === 'string'){ try { onState(JSON.parse(e.data)); } catch(_){} return; }
+    if(typeof e.data === 'string'){ try{ const m=JSON.parse(e.data); groups=m.groups||[]; presets=m.presets||[]; }catch(_){} return; }
     const rtt = performance.now() - sentAt;
-    await draw(e.data);
-    ema = ema ? ema*0.8 + rtt*0.2 : rtt;
-    stat.textContent = `round-trip ${rtt.toFixed(0)} ms (avg ${ema.toFixed(0)}) · ${(e.data.size/1024).toFixed(0)} KB · ${++frames} frames`;
+    const bmp = await createImageBitmap(e.data);
+    fitCanvas(imgC); ictx.imageSmoothingQuality='high';
+    drawContain(ictx, bmp, imgC.width, imgC.height); bmp.close();
+    ema = ema ? ema*0.8+rtt*0.2 : rtt;
+    if(state===ST.IDLE) hud.textContent = `${rtt.toFixed(0)} ms · hold to edit`;
     inFlight = false;
-    if(queued !== null){ const q = queued; queued = null; send(q); }
+    if(queued!==null){ const q=queued; queued=null; sendParam(q.g,q.p,q.v); }
   };
 }
-
-// throttle: one render in flight; keep only the latest pending value.
-function send(v){
-  const f = curFav(); if(!f || f.kind !== 'param') return;
-  if(!ws || ws.readyState !== 1) return;
-  f.cur = +v;
-  if(inFlight){ queued = v; return; }
+function sendParam(gi, pi, v){
+  const it = groups[gi].items[pi];
+  it.cur = v;
+  if(!ws || ws.readyState!==1) return;
+  if(inFlight){ queued={g:gi,p:pi,v}; return; }
   inFlight = true; sentAt = performance.now();
-  ws.send(`P ${f.modid} ${f.parid} ${v}`);
+  ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`);
 }
 
-favSel.addEventListener('change', syncSlider);
-s.addEventListener('input', () => send(s.value));
+// ---- canvas helpers ----
+function fitCanvas(c){ const d=devicePixelRatio||1, w=innerWidth*d|0, h=innerHeight*d|0;
+  if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } }
+function drawContain(ctx, bmp, W, H){
+  const s = Math.min(W/bmp.width, H/bmp.height), w=bmp.width*s, h=bmp.height*s;
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  ctx.drawImage(bmp, (W-w)/2, (H-h)/2, w, h);
+}
+
+// ---- radial interaction ----
+const ST = { IDLE:0, GROUPS:1, PARAMS:2, VALUE:3 };
+let state = ST.IDLE;
+let cx=0, cy=0;           // ring center (css px)
+let curGroup=-1, curItem=-1, hover=-1;
+let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1;
+const R = () => Math.min(innerWidth, innerHeight) * 0.34;
+const R0 = () => R() * 0.4;
+
+function ringItems(){
+  if(state===ST.GROUPS) return groups.map(g=>g.label);
+  if(state===ST.PARAMS) return groups[curGroup].items.map(it=>it.label);
+  return [];
+}
+function pick(x,y){
+  const dx=x-cx, dy=y-cy, n=ringItems().length;
+  if(!n || dx*dx+dy*dy < R0()*R0()) return -1;
+  let a = Math.atan2(dy,dx) + Math.PI;          // 0..2pi from -x axis
+  return Math.min(n-1, Math.floor(a / (2*Math.PI/n)));
+}
+
+function drawOverlay(){
+  fitCanvas(ovr);
+  const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
+  octx.clearRect(0,0,innerWidth,innerHeight);
+  if(state===ST.IDLE) return;
+
+  if(state===ST.VALUE){
+    const it=valItem, frac=(it.cur-it.min)/(it.max-it.min);
+    const y=innerHeight*0.5, m=40, w=innerWidth-2*m;
+    octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,innerWidth,innerHeight);
+    octx.strokeStyle='#444'; octx.lineWidth=4; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w,y); octx.stroke();
+    octx.strokeStyle='#6cf'; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w*Math.max(0,Math.min(1,frac)),y); octx.stroke();
+    octx.fillStyle='#6cf'; octx.beginPath(); octx.arc(m+w*Math.max(0,Math.min(1,frac)),y,12,0,7); octx.fill();
+    octx.fillStyle='#fff'; octx.textAlign='center'; octx.font='600 20px system-ui';
+    octx.fillText(`${it.label}   ${it.cur.toFixed(3)}`, innerWidth/2, y-30);
+    octx.fillStyle='#999'; octx.font='13px system-ui';
+    octx.fillText('drag to adjust · release to apply', innerWidth/2, y+34);
+    return;
+  }
+
+  const items=ringItems(), n=items.length, r=R(), seg=2*Math.PI/n;
+  octx.fillStyle='rgba(0,0,0,.4)'; octx.fillRect(0,0,innerWidth,innerHeight);
+  for(let i=0;i<n;i++){
+    const a0=i*seg-Math.PI, a1=a0+seg, mid=a0+seg/2;
+    octx.beginPath(); octx.moveTo(cx+Math.cos(a0)*R0(), cy+Math.sin(a0)*R0());
+    octx.arc(cx,cy,r,a0,a1); octx.arc(cx,cy,R0(),a1,a0,true); octx.closePath();
+    octx.fillStyle = (i===hover) ? 'rgba(80,150,230,.85)' : 'rgba(30,32,38,.85)';
+    octx.fill(); octx.strokeStyle='rgba(255,255,255,.12)'; octx.lineWidth=1; octx.stroke();
+    octx.fillStyle = (i===hover)?'#fff':'#cdd'; octx.textAlign='center'; octx.textBaseline='middle';
+    octx.font=(i===hover?'600 ':'')+'13px system-ui';
+    octx.fillText(items[i], cx+Math.cos(mid)*r*0.72, cy+Math.sin(mid)*r*0.72);
+  }
+  octx.fillStyle='#888'; octx.textAlign='center'; octx.textBaseline='middle'; octx.font='12px system-ui';
+  octx.fillText(state===ST.GROUPS?'module':groups[curGroup].label, cx, cy);
+}
+
+function pos(e){ return {x:e.clientX, y:e.clientY}; }
+
+ovr.addEventListener('pointerdown', e=>{
+  ovr.setPointerCapture(e.pointerId); const p=pos(e);
+  if(state===ST.IDLE || state===ST.GROUPS || state===ST.PARAMS){
+    cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay();
+  } else if(state===ST.VALUE){
+    valStartX=p.x; valBase=valItem.cur; drawOverlay();
+  }
+});
+ovr.addEventListener('pointermove', e=>{
+  if(state===ST.IDLE) return; const p=pos(e);
+  if(state===ST.VALUE){
+    if(e.buttons||e.pressure>0){
+      const range=valItem.max-valItem.min, dx=p.x-valStartX;
+      let v=valBase + (dx/(innerWidth*0.8))*range;
+      v=Math.max(valItem.min, Math.min(valItem.max, v));
+      sendParam(valGI, valPI, v); drawOverlay();
+      hud.textContent=`${valItem.label} ${v.toFixed(3)}`;
+    }
+    return;
+  }
+  hover=pick(p.x,p.y); drawOverlay();
+});
+ovr.addEventListener('pointerup', e=>{
+  const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
+  if(state===ST.GROUPS){
+    if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; }
+    else state=ST.IDLE;
+  } else if(state===ST.PARAMS){
+    if(sel>=0){ curItem=sel; valItem=groups[curGroup].items[sel]; valGI=curGroup; valPI=sel; state=ST.VALUE; }
+    else state=ST.IDLE;
+  } else if(state===ST.VALUE){
+    state=ST.IDLE; hud.textContent='hold to edit';
+  }
+  drawOverlay();
+});
+
+addEventListener('resize', ()=>{ if(state!==ST.IDLE) drawOverlay(); });
 connect();
 </script>
 </body>

@@ -1,16 +1,17 @@
-// rabbit_editor web remote server (M3.1).
+// rabbit_editor web remote server (M3.2).
 //
 // Keeps one vkdt graph + its GPU buffers warm and serves a tiny web client over
-// HTTP/WebSocket (civetweb). On connect it sends a `state` message describing the
-// favourite parameters (read from darkroom.ui, resolved against the live graph,
-// with min/max/default/current metadata) -- the data a touch radial menu needs.
+// HTTP/WebSocket (civetweb). On connect it sends a `menu` message generated
+// DYNAMICALLY from the live graph: every module that has editable (slider, float,
+// scalar) parameters becomes a group, with each parameter's min/max/default/current
+// -- exactly the data a touch radial/chord menu needs, no fixed favourites list.
 // The client sends `P <modid> <parid> <value>`; the server writes the parameter,
 // re-renders on the GPU and pushes the resulting JPEG back as a binary WS frame.
 //
-// usage: vkdt-server [docroot] [port] [graph.cfg]
+// usage: vkdt-server [docroot] [port] [graph.cfg] [image.jpg]
 //
-// No TLS here on purpose -- Tailscale Serve terminates HTTPS/WSS in front.
-// readback still via o-jpg file; WebP-in-memory is a later refinement.
+// The image is edited as a downscaled preview proxy (full-res only for export).
+// No TLS here -- Tailscale Serve terminates HTTPS/WSS in front.
 
 #include "qvk/qvk.h"
 #include "pipe/graph.h"
@@ -31,29 +32,22 @@
 #include <pthread.h>
 #include <signal.h>
 
-typedef struct fav_t
-{
-  int  is_preset;
-  int  modid, parid;     // for params
-  char preset[64];       // for presets
-  char label[80];
-} fav_t;
-
 static dt_graph_t      g_graph;
-static int             g_outmod = -1;
 static pthread_mutex_t g_lock   = PTHREAD_MUTEX_INITIALIZER;
 static const char     *g_jpgbase = "preview";
 static char            g_jpgpath[512];
 static volatile int    g_stop = 0;
-
-static fav_t           g_fav[32];
-static int             g_favcnt = 0;
-static char            g_state_json[16384];
+static char            g_menu_json[65536];
 
 static inline double now_ms()
 {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static inline int is_radial_slider(const dt_ui_param_t *p)
+{
+  return p->widget.type == dt_token("slider") && p->type == dt_token("float") && p->cnt == 1;
 }
 
 static inline float param_get(int modid, int parid)
@@ -62,7 +56,7 @@ static inline float param_get(int modid, int parid)
   return *(float *)((uint8_t *)g_graph.module[modid].param + p->offset);
 }
 
-// run the warm graph (with any extra runflags) and slurp the fresh jpeg.
+// run the warm graph (plus any extra runflags) and slurp the fresh jpeg.
 // caller frees. NULL on failure. call with g_lock held.
 static unsigned char *render_to_jpeg(size_t *out_len, double *render_ms, dt_graph_run_t extra)
 {
@@ -70,7 +64,6 @@ static unsigned char *render_to_jpeg(size_t *out_len, double *render_ms, dt_grap
   g_graph.runflags = s_graph_run_record_cmd_buf | s_graph_run_download_sink | s_graph_run_wait_done | extra;
   if(dt_graph_run(&g_graph, g_graph.runflags) != VK_SUCCESS) return NULL;
   if(render_ms) *render_ms = now_ms() - t0;
-
   FILE *f = fopen(g_jpgpath, "rb");
   if(!f) return NULL;
   fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -94,72 +87,63 @@ static void push_frame(struct mg_connection *c, dt_graph_run_t extra)
   free(b);
 }
 
-// read darkroom.ui, resolve favourites against the live graph, keep slider floats
-// and presets. cwd is the bin/ dir, so darkroom.ui sits right here.
-static void load_favs(void)
+static char *json_label(char *o, char *e, const dt_token_t modname, const dt_ui_param_t *p)
 {
-  FILE *f = fopen("darkroom.ui", "r");
-  if(!f) { fprintf(stderr, "[srv] no darkroom.ui, no favourites\n"); return; }
-  char line[256];
-  while(fgets(line, sizeof(line), f) && g_favcnt < (int)(sizeof(g_fav)/sizeof(g_fav[0])))
-  {
-    line[strcspn(line, "\r\n")] = 0;
-    if(!line[0] || line[0] == '#') continue;
-    char *a = strtok(line, ":");
-    char *b = strtok(NULL, ":");
-    char *c = strtok(NULL, "");   // rest of line (preset name has no further colon)
-    if(!a || !b) continue;
-    fav_t *fv = g_fav + g_favcnt;
-    if(!strcmp(a, "preset"))
-    {
-      if(!c) continue;
-      fv->is_preset = 1;
-      snprintf(fv->preset, sizeof(fv->preset), "%s", c);
-      snprintf(fv->label,  sizeof(fv->label),  "%s", b);  // human description
-      g_favcnt++;
-      continue;
-    }
-    if(!c) continue;
-    int modid = dt_module_get(&g_graph, dt_token(a), dt_token(b));
-    if(modid < 0) continue;
-    int parid = dt_module_get_param(g_graph.module[modid].so, dt_token(c));
-    if(parid < 0) continue;
-    const dt_ui_param_t *p = g_graph.module[modid].so->param[parid];
-    if(p->widget.type != dt_token("slider")) continue; // radial value widget supports sliders
-    if(p->type != dt_token("float") || p->cnt != 1)  continue; // scalar float only, for now
-    fv->is_preset = 0; fv->modid = modid; fv->parid = parid;
-    if(p->long_name && p->long_name[0]) snprintf(fv->label, sizeof(fv->label), "%s", p->long_name);
-    else snprintf(fv->label, sizeof(fv->label), "%"PRItkn" %"PRItkn,
-        dt_token_str(g_graph.module[modid].name), dt_token_str(p->name));
-    g_favcnt++;
-  }
-  fclose(f);
-  fprintf(stderr, "[srv] %d favourites resolved from darkroom.ui\n", g_favcnt);
+  if(p->long_name && p->long_name[0])
+    return o + snprintf(o, e-o, "%s", p->long_name);
+  return o + snprintf(o, e-o, "%"PRItkn, dt_token_str(p->name));
 }
 
-// build the (static) state json once. current values are refreshed lazily below.
-static void build_state_json(void)
+// dynamically enumerate the graph: every module with >=1 radial-slider param
+// becomes a menu group. presets come from darkroom.ui (display only for now).
+static void build_menu_json(void)
 {
-  char *o = g_state_json; char *e = g_state_json + sizeof(g_state_json);
-  o += snprintf(o, e-o, "{\"type\":\"state\",\"favs\":[");
-  for(int i = 0; i < g_favcnt; i++)
+  char *o = g_menu_json, *e = g_menu_json + sizeof(g_menu_json);
+  o += snprintf(o, e-o, "{\"type\":\"menu\",\"groups\":[");
+  int firstgrp = 1;
+  for(int m = 0; m < g_graph.num_modules; m++)
   {
-    fav_t *fv = g_fav + i;
-    if(i) o += snprintf(o, e-o, ",");
-    if(fv->is_preset)
+    dt_module_so_t *so = g_graph.module[m].so;
+    if(!so) continue;
+    int has = 0;
+    for(int pi = 0; pi < so->num_params; pi++) if(is_radial_slider(so->param[pi])) { has = 1; break; }
+    if(!has) continue;
+    if(!firstgrp) o += snprintf(o, e-o, ",");
+    firstgrp = 0;
+    o += snprintf(o, e-o, "{\"label\":\"%"PRItkn"\",\"modid\":%d,\"items\":[",
+        dt_token_str(g_graph.module[m].name), m);
+    int firstit = 1;
+    for(int pi = 0; pi < so->num_params; pi++)
     {
-      o += snprintf(o, e-o, "{\"i\":%d,\"kind\":\"preset\",\"label\":\"%s\",\"preset\":\"%s\"}",
-          i, fv->label, fv->preset);
+      const dt_ui_param_t *p = so->param[pi];
+      if(!is_radial_slider(p)) continue;
+      if(!firstit) o += snprintf(o, e-o, ",");
+      firstit = 0;
+      o += snprintf(o, e-o, "{\"label\":\"");
+      o = json_label(o, e, g_graph.module[m].name, p);
+      o += snprintf(o, e-o, "\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
+          pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
     }
-    else
+    o += snprintf(o, e-o, "]}");
+  }
+  o += snprintf(o, e-o, "],\"presets\":[");
+  // presets from darkroom.ui (cwd = bin)
+  FILE *f = fopen("darkroom.ui", "r");
+  if(f)
+  {
+    char line[256]; int firstp = 1;
+    while(fgets(line, sizeof(line), f))
     {
-      const dt_ui_param_t *p = g_graph.module[fv->modid].so->param[fv->parid];
-      o += snprintf(o, e-o,
-          "{\"i\":%d,\"kind\":\"param\",\"label\":\"%s\",\"modid\":%d,\"parid\":%d,"
-          "\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
-          i, fv->label, fv->modid, fv->parid,
-          p->widget.min, p->widget.max, p->val[0], param_get(fv->modid, fv->parid));
+      line[strcspn(line, "\r\n")] = 0;
+      if(strncmp(line, "preset:", 7)) continue;
+      char *desc = strtok(line + 7, ":");
+      char *name = strtok(NULL, "");
+      if(!desc || !name) continue;
+      if(!firstp) o += snprintf(o, e-o, ",");
+      firstp = 0;
+      o += snprintf(o, e-o, "{\"label\":\"%s\",\"preset\":\"%s\"}", desc, name);
     }
+    fclose(f);
   }
   o += snprintf(o, e-o, "]}");
 }
@@ -170,8 +154,8 @@ static void ws_close  (const struct mg_connection *c, void *u) { (void)c; (void)
 static void ws_ready(struct mg_connection *c, void *u)
 {
   (void)u;
-  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, g_state_json, strlen(g_state_json));
-  push_frame(c, s_graph_run_none); // initial image
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, g_menu_json, strlen(g_menu_json));
+  push_frame(c, s_graph_run_none);
 }
 
 static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *u)
@@ -181,7 +165,6 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   char tmp[128]; size_t k = len < sizeof(tmp)-1 ? len : sizeof(tmp)-1;
   memcpy(tmp, data, k); tmp[k] = 0;
 
-  // protocol: "P <modid> <parid> <value>"  -> set parameter and re-render
   int modid, parid; float v;
   if(sscanf(tmp, "P %d %d %f", &modid, &parid, &v) == 3 &&
      modid >= 0 && modid < g_graph.num_modules)
@@ -214,7 +197,7 @@ int main(int argc, char *argv[])
   const char *docroot = argc > 1 ? argv[1] : "../web";
   const char *port    = argc > 2 ? argv[2] : "8090";
   const char *cfg     = argc > 3 ? argv[3] : "examples/m3.cfg";
-  const char *image   = argc > 4 ? argv[4] : NULL; // override i-jpg:main filename
+  const char *image   = argc > 4 ? argv[4] : NULL;
 
   dt_log_init(s_log_cli);
   dt_pipe_global_init();
@@ -233,11 +216,11 @@ int main(int argc, char *argv[])
   param.output[0].quality          = 90;
   param.output[0].colour_primaries = s_colour_primaries_srgb;
   param.output[0].colour_trc       = s_colour_trc_srgb;
-  param.output[0].max_width        = 1280;   // cap preview resolution for mobile
+  param.output[0].max_width        = 1280;
   param.output[0].max_height       = 1280;
-  // preview proxy: the full-res source would be re-decoded each frame (~400ms for
-  // a 12MP jpeg). Edit a downscaled proxy instead (full-res is only for export,
-  // M5). Lightroom's "smart preview" pattern. TODO proper fix: keep source resident.
+
+  // preview proxy: full-res source would be re-decoded each frame (~400ms/12MP).
+  // edit a downscaled proxy; full-res is only for export (M5). TODO keep source resident.
   const char *use_image = image;
   char proxypath[1024];
   if(image)
@@ -246,15 +229,14 @@ int main(int argc, char *argv[])
     char cmd[2400];
     snprintf(cmd, sizeof(cmd),
         "python3 -c 'from PIL import Image; im=Image.open(\"%s\"); "
-        "im.thumbnail((1600,1600)); im.save(\"%s\",quality=92)' 2>/dev/null",
-        image, proxypath);
+        "im.thumbnail((1600,1600)); im.save(\"%s\",quality=92)' 2>/dev/null", image, proxypath);
     if(system(cmd) == 0 && access(proxypath, R_OK) == 0)
     { use_image = proxypath; fprintf(stderr, "[srv] preview proxy %s <- %s\n", proxypath, image); }
-    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow re-decode per frame)\n", image);
+    else fprintf(stderr, "[srv] proxy failed, full-res %s (slow)\n", image);
   }
   char imgline[1024]; char *extra[1];
   if(use_image)
-  { // inject the input image before the graph runs (extra params apply post display-replace)
+  {
     snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
     extra[0] = imgline;
     param.extra_param_cnt = 1;
@@ -263,12 +245,9 @@ int main(int argc, char *argv[])
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
   { fprintf(stderr, "[srv] graph setup failed for '%s'\n", cfg); return 1; }
 
-  g_outmod = dt_module_get(&g_graph, dt_token("o-jpg"), dt_token("main"));
   snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
-  load_favs();
-  build_state_json();
-  fprintf(stderr, "[srv] graph warm. o-jpg id=%d  jpg=%s  state=%zu B\n",
-      g_outmod, g_jpgpath, strlen(g_state_json));
+  build_menu_json();
+  fprintf(stderr, "[srv] graph warm. jpg=%s  menu=%zu B\n", g_jpgpath, strlen(g_menu_json));
 
   signal(SIGINT, on_sigint);
   mg_init_library(0);
@@ -277,7 +256,7 @@ int main(int argc, char *argv[])
     "listening_ports", port,
     "num_threads",     "4",
     "enable_directory_listing", "no",
-    "tcp_nodelay",     "1",   // disable Nagle: small WS frames must not stall ~40ms on delayed-ACK
+    "tcp_nodelay",     "1",
     NULL
   };
   struct mg_callbacks cb; memset(&cb, 0, sizeof(cb));
