@@ -150,7 +150,7 @@ function cropHandleAt(x,y){ const r=imgRect();
   const L=r.ix+cr[0]*r.iw, R=r.ix+cr[1]*r.iw, T=r.iy+cr[2]*r.ih, B=r.iy+cr[3]*r.ih;
   // big grab bands so corners/edges are reachable far from the screen edge (no need
   // to touch the very edge). band ~30% of the rect, generous min, capped.
-  const cz=Math.min(140, Math.max(56, Math.min(R-L, B-T)*0.30)), M=44;
+  const sz=Math.min(R-L, B-T); let cz=Math.max(56, sz*0.33); cz=Math.min(cz, sz*0.45); const M=44;
   if(x<L-M||x>R+M||y<T-M||y>B+M) return null;          // well outside the rect → nothing
   const xb = x < L+cz ? 'l' : x > R-cz ? 'r' : '';
   const yb = y < T+cz ? 't' : y > B-cz ? 'b' : '';
