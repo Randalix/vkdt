@@ -139,7 +139,7 @@ CLI=../bin/vkdt-cli ../bin/vkdt-fit
 cli: Makefile bin src/core/version.h
 	$(MAKE) -C src/ $(CLI) tools modules
 
-server: Makefile bin src/core/version.h
+server: Makefile bin lut src/core/version.h
 	$(MAKE) -C src/ ../bin/vkdt-server modules
 
 LIB=../bin/libvkdt.so
