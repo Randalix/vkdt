@@ -402,9 +402,6 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     dt_graph_run_t fl = s_graph_run_none;
     if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old0);
     if(is_crop(p)) fl |= s_graph_run_all;  // crop changes ROI -> needs modify_roi re-run
-    lg("dbg", "V mod=%d par=%d crop=%d cnt=%d w=[%g %g %g %g] fl=%u in=%dx%d out=%dx%d", modid, parid,
-        is_crop(p), p->cnt, w[0],w[1],w[2],w[3], (unsigned)fl,
-        m->connector[0].roi.full_wd, m->connector[0].roi.full_ht, m->connector[1].roi.full_wd, m->connector[1].roi.full_ht);
     g_graph.active_module = modid;
     dt_graph_history_append(&g_graph, modid, parid, 2.0);  // throttle: a drag coalesces to one entry
     size_t n = 0; double ms = 0;
@@ -462,6 +459,18 @@ static int make_proxy(const char *in, const char *out, int maxdim)
 // g_lock held when re-opening at runtime.
 static int open_image(const char *image)
 {
+  // decode the image to a preview proxy BEFORE touching the live graph, so a bad or
+  // unsupported file (HEIC, corrupt, wrong format) leaves the current session intact
+  // instead of tearing the graph down into a broken state.
+  char proxypath[1024] = ""; const char *use_image = image;
+  if(image)
+  {
+    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
+    if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
+    { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
+    else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
+  }
+
   static int built = 0;
   if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
   dt_graph_init(&g_graph, s_queue_compute);
@@ -480,19 +489,14 @@ static int open_image(const char *image)
   param.output[0].max_width        = g_conf.preview_max;
   param.output[0].max_height       = g_conf.preview_max;
 
-  const char *use_image = image;
-  char proxypath[1024], imgline[1280]; char *extra[1];
+  char imgline[1280]; char *extra[1];
   if(image)
   {
-    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
-    if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
-    { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
-    else lg("err", "proxy failed for %s (full-res, slow)", image);
     snprintf(imgline, sizeof(imgline), "param:i-jpg:main:filename:%s", use_image);
     extra[0] = imgline; param.extra_param_cnt = 1; param.p_extra_param = extra;
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
-  { lg("err", "graph setup failed for '%s'", g_conf.cfg); return 1; }
+  { lg("err", "graph export failed for '%s'", g_conf.cfg); return 1; }
   snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
 
   // restore this image's recipe (param overlay onto the template; skip i-jpg input)
