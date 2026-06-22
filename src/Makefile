@@ -55,6 +55,7 @@ include snd/flat.mk
 include gui/flat.mk
 include cli/flat.mk
 include fit/flat.mk
+include server/flat.mk
 include tools/flat.mk
 
 clean: Makefile
@@ -102,6 +103,9 @@ db/%.o: db/%.c Makefile $(DB_H) db/flat.mk
 cli/%.o: cli/%.c Makefile $(CLI_H) cli/flat.mk
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(VK_CFLAGS) $(CLI_CFLAGS) -c $< -o $@
 
+server/%.o: server/%.c Makefile $(SERVER_H) server/flat.mk
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(VK_CFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
 fit/%.o: fit/%.c Makefile $(FIT_H) fit/flat.mk
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(VK_CFLAGS) $(FIT_CFLAGS) -c $< -o $@
 
@@ -119,6 +123,12 @@ gui/%.o: gui/%.c Makefile $(GUI_H) gui/flat.mk
 ../bin/vkdt-cli: $(CLI_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) Makefile
 	$(CC) $(CLI_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) -pie -o $@ \
     $(LDFLAGS) $(CLI_LDFLAGS) $(QVK_LDFLAGS) $(PIPE_LDFLAGS) $(CORE_LDFLAGS) $(DB_LDFLAGS) $(OPT_LDFLAGS)
+
+# web remote server (rabbit_editor)
+# ======================
+../bin/vkdt-server: $(SERVER_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) Makefile
+	$(CC) $(SERVER_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) -pie -o $@ \
+    $(LDFLAGS) $(SERVER_LDFLAGS) $(QVK_LDFLAGS) $(PIPE_LDFLAGS) $(CORE_LDFLAGS) $(DB_LDFLAGS) $(OPT_LDFLAGS)
 
 # parameter optimiser
 # ======================

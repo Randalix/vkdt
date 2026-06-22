@@ -1,0 +1,4 @@
+SERVER_O=server/m1_resident.o
+SERVER_H=
+SERVER_CFLAGS=
+SERVER_LDFLAGS=$(DYNAMIC) -lm

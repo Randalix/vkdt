@@ -3,7 +3,7 @@
 # dispatches external builds and calls our main makefile in src.
 # also handles some global settings for compilers and debug flags.
 
-.PHONY:all src clean distclean bin install release cli lut info
+.PHONY:all src clean distclean bin install release cli server lut info
 ifeq ($(OS),Windows_NT)
 include bin/config.mk.defaults.w64
 else
@@ -138,6 +138,9 @@ reload-shaders: Makefile
 CLI=../bin/vkdt-cli ../bin/vkdt-fit
 cli: Makefile bin src/core/version.h
 	$(MAKE) -C src/ $(CLI) tools modules
+
+server: Makefile bin src/core/version.h
+	$(MAKE) -C src/ ../bin/vkdt-server modules
 
 LIB=../bin/libvkdt.so
 lib: Makefile bin src/core/version.h

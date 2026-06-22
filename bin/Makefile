@@ -1,4 +1,4 @@
-.PHONY: all debug sanitize sanitize-thread cli reload-shaders clean distclean
+.PHONY: all debug sanitize sanitize-thread cli server reload-shaders clean distclean
 
 all:
 	$(MAKE) -C .. all
@@ -14,6 +14,9 @@ sanitize-thread:
 
 cli:
 	$(MAKE) -C .. cli
+
+server:
+	$(MAKE) -C .. server
 
 lib:
 	$(MAKE) -C .. lib
