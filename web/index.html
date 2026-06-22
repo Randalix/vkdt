@@ -37,7 +37,7 @@
 const imgC=document.getElementById('img'), ictx=imgC.getContext('2d',{alpha:false});
 const ovr=document.getElementById('menu'), octx=ovr.getContext('2d');
 const hud=document.getElementById('hud'), bar=document.getElementById('bar');
-let ws, sentAt=0, inFlight=false, queued=null, ema=0, groups=[];
+let ws, sentAt=0, inFlight=false, pending=null, ema=0, groups=[];
 
 // ---- websocket ----
 function connect(){
@@ -53,15 +53,16 @@ function connect(){
     if(lastBmp) lastBmp.close(); lastBmp=bmp; drawView();   // keep current zoom/pan across frames
     ema=ema?ema*0.8+rtt*0.2:rtt;
     if(state===ST.IDLE) hud.textContent=`${rtt.toFixed(0)} ms · hold or tap`;
-    inFlight=false; if(queued!==null){ const q=queued; queued=null; sendParam(q.g,q.p,q.v); }
+    inFlight=false; if(pending){ const fn=pending; pending=null; inFlight=true; sentAt=performance.now(); fn(); }
   };
 }
-function sendParam(gi,pi,v){
-  const it=groups[gi].items[pi]; it.cur=v;
-  if(!ws||ws.readyState!==1) return;
-  if(inFlight){ queued={g:gi,p:pi,v}; return; }
-  inFlight=true; sentAt=performance.now(); ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`);
-}
+// one render in flight; keep only the latest pending send
+function rawSend(fn){ if(!ws||ws.readyState!==1) return;
+  if(inFlight){ pending=fn; return; } inFlight=true; sentAt=performance.now(); fn(); }
+function sendParam(gi,pi,v){ const it=groups[gi].items[pi]; it.cur=v;
+  rawSend(()=>ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`)); }
+function sendVec(gi,pi){ const it=groups[gi].items[pi];
+  rawSend(()=>ws.send(`V ${groups[gi].modid} ${it.parid} ${it.cur.join(' ')}`)); }
 function fitCanvas(c){ const d=devicePixelRatio||1,w=innerWidth*d|0,h=innerHeight*d|0; if(c.width!==w||c.height!==h){c.width=w;c.height=h;} }
 // view = zoom/pan over the received preview bitmap (tx/ty in CSS px, scale>=1)
 let lastBmp=null, view={scale:1, tx:0, ty:0};
@@ -99,13 +100,33 @@ function reorderBar(){
 }
 
 // ---- shared value scrub (drag anywhere — no need to hit a slider) ----
-const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3 };
+const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3, WHEEL:4 };
 let state=ST.IDLE, cx=0, cy=0, curGroup=-1, hover=-1;
 let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1, scrubbing=false;
 const R =()=>Math.min(innerWidth,innerHeight)*0.34, R0=()=>R()*0.4;
+const RT32=0.8660254, INV_RT3=0.5773503, CH_SENS=1.2;  // colour-wheel mapping (matches vkdt)
 
-function enterValue(gi,pi){ valGI=gi; valPI=pi; valItem=groups[gi].items[pi]; state=ST.VALUE; scrubbing=false;
-  markActive(gi,pi); drawOverlay(); hud.textContent=`${valItem.label} — drag anywhere`; }
+// ---- colour wheel (2D chroma trackball + master), mirrors vkdt's colwheel ----
+let whItem=null, whGI=-1, whPI=-1, whDrag=null, whLX=0, whLY=0;
+const WCX=()=>innerWidth/2, WCY=()=>innerHeight*0.40, WR=()=>Math.min(innerWidth,innerHeight)*0.28;
+function enterWheel(gi,pi){ whGI=gi; whPI=pi; whItem=groups[gi].items[pi];
+  if(!Array.isArray(whItem.cur)) whItem.cur=[...(whItem.def||[0,0,0,0])];
+  whDrag=null; state=ST.WHEEL; markActive(gi,pi); drawOverlay();
+  hud.textContent=`${whItem.label} — drag wheel = colour · bar = master`; }
+function wheelChroma(dx,dy){ const it=whItem, def=it.def, cur=it.cur;
+  const sx=dx/(WR()*2)*CH_SENS, sy=dy/(WR()*2)*CH_SENS;
+  let disp=[cur[0]-def[0], cur[1]-def[1], cur[2]-def[2]];
+  disp[0]+=-2/3*sy; disp[1]+=1/3*sy-INV_RT3*sx; disp[2]+=1/3*sy+INV_RT3*sx;
+  const wx=disp[2]-disp[1], wy=(-disp[0]+0.5*(disp[1]+disp[2]))/RT32, dd=wx*wx+wy*wy;
+  if(dd>1){ const s=1/Math.sqrt(dd); disp=disp.map(x=>x*s); }
+  cur[0]=def[0]+disp[0]; cur[1]=def[1]+disp[1]; cur[2]=def[2]+disp[2]; sendVec(whGI,whPI); }
+function wheelMaster(dx){ const it=whItem, range=it.max-it.min;
+  it.cur[3]=Math.max(it.min, Math.min(it.max, it.cur[3]+(dx/(innerWidth*0.8))*range)); sendVec(whGI,whPI); }
+
+function enterValue(gi,pi){ const it=groups[gi].items[pi];
+  if(it.kind==='wheel'){ enterWheel(gi,pi); return; }
+  valGI=gi; valPI=pi; valItem=it; state=ST.VALUE; scrubbing=false;
+  markActive(gi,pi); drawOverlay(); hud.textContent=`${it.label} — drag anywhere`; }
 
 function ringItems(){ if(state===ST.GROUPS) return groups.map(g=>g.label);
   if(state===ST.PARAMS) return groups[curGroup].items.map(it=>it.label); return []; }
@@ -117,6 +138,27 @@ function drawOverlay(){
   fitCanvas(ovr); const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
   octx.clearRect(0,0,innerWidth,innerHeight);
   if(state===ST.IDLE) return;
+  if(state===ST.WHEEL){
+    const it=whItem, ccx=WCX(), ccy=WCY(), r=WR(), def=it.def, cur=it.cur;
+    for(let i=0;i<48;i++){ const a0=2*Math.PI*i/48, a1=2*Math.PI*(i+1)/48+0.01, h=-(a0+a1)/2-Math.PI/2;
+      octx.beginPath(); octx.moveTo(ccx,ccy); octx.arc(ccx,ccy,r,a0,a1); octx.closePath();
+      octx.fillStyle=`rgb(${(0.5+0.5*Math.cos(h))*255|0},${(0.5+0.5*Math.cos(h-2.0944))*255|0},${(0.5+0.5*Math.cos(h+2.0944))*255|0})`;
+      octx.fill(); }
+    octx.beginPath(); octx.arc(ccx,ccy,r*0.80,0,7); octx.fillStyle='rgba(18,18,22,.92)'; octx.fill();
+    const disp=[cur[0]-def[0],cur[1]-def[1],cur[2]-def[2]];
+    const wx=disp[2]-disp[1], wy=(-disp[0]+0.5*(disp[1]+disp[2]))/RT32, px=ccx+wx*r, py=ccy+wy*r;
+    octx.strokeStyle='rgba(150,150,150,.5)'; octx.lineWidth=1;
+    octx.beginPath(); octx.moveTo(ccx-8,ccy); octx.lineTo(ccx+8,ccy); octx.moveTo(ccx,ccy-8); octx.lineTo(ccx,ccy+8); octx.stroke();
+    octx.beginPath(); octx.arc(px,py,9,0,7); octx.fillStyle='#fff'; octx.fill(); octx.strokeStyle='#000'; octx.lineWidth=2; octx.stroke();
+    const my=ccy+r+26, mw=r*1.6, mx=ccx-mw/2, frac=Math.max(0,Math.min(1,(cur[3]-it.min)/(it.max-it.min)));
+    octx.strokeStyle='rgba(255,255,255,.3)'; octx.lineWidth=4; octx.lineCap='round';
+    octx.beginPath(); octx.moveTo(mx,my); octx.lineTo(mx+mw,my); octx.stroke();
+    octx.strokeStyle='#bbb'; octx.beginPath(); octx.moveTo(mx,my); octx.lineTo(mx+mw*frac,my); octx.stroke();
+    octx.fillStyle='#fff'; octx.textAlign='center'; octx.textBaseline='alphabetic'; octx.shadowColor='#000'; octx.shadowBlur=4;
+    octx.font='600 18px system-ui'; octx.fillText(it.label, ccx, ccy-r-14);
+    octx.font='12px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag wheel = colour · bar = master', ccx, my+26);
+    octx.shadowBlur=0; return;
+  }
   if(state===ST.VALUE){
     const it=valItem, frac=Math.max(0,Math.min(1,(it.cur-it.min)/(it.max-it.min)));
     const y=innerHeight*0.40, m=40, w=innerWidth-2*m;
@@ -166,14 +208,28 @@ ovr.addEventListener('pointerdown', e=>{
   if(pointers.size>=2){ blockRadial=true; if(state!==ST.IDLE){ state=ST.IDLE; markActive(-1); drawOverlay(); } startPinch(); return; }
   if(blockRadial) return;
   const p=pos(e);
-  if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; }
-  else { cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay(); }
+  if(state===ST.WHEEL){
+    const dxc=p.x-WCX(), dyc=p.y-WCY(), inWheel=(dxc*dxc+dyc*dyc)<=(WR()*1.15)**2;
+    const my=WCY()+WR()+26, mw=WR()*1.6, mx=WCX()-mw/2;
+    const inMaster=(p.x>=mx-14 && p.x<=mx+mw+14 && Math.abs(p.y-my)<28);
+    if(inWheel){ whDrag='chroma'; whLX=p.x; whLY=p.y; }
+    else if(inMaster){ whDrag='master'; whLX=p.x; whLY=p.y; }
+    else { state=ST.IDLE; whDrag=null; markActive(-1); hud.textContent='hold or tap'; drawOverlay(); }
+    return;
+  }
+  if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; return; }
+  cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay();
 });
 ovr.addEventListener('pointermove', e=>{
   if(pointers.has(e.pointerId)) pointers.set(e.pointerId, pos(e));
   if(pointers.size>=2){ updatePinch(); return; }
   if(blockRadial || state===ST.IDLE) return;
   const p=pos(e);
+  if(state===ST.WHEEL){
+    if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y;
+      if(whDrag==='chroma') wheelChroma(dx,dy); else wheelMaster(dx); drawOverlay(); }
+    return;
+  }
   if(state===ST.VALUE){
     if(scrubbing){ const range=valItem.max-valItem.min;
       let val=valBase+((p.x-valStartX)/(innerWidth*0.8))*range;
@@ -191,6 +247,7 @@ function endPointer(e){
   if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
   else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
   else if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI); state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
+  else if(state===ST.WHEEL){ if(whDrag) bumpUsage(whGI,whPI); whDrag=null; } // stay in wheel for more strokes
   drawOverlay();
 }
 ovr.addEventListener('pointerup', endPointer);

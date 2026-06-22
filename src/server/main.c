@@ -49,6 +49,11 @@ static inline int is_radial_slider(const dt_ui_param_t *p)
 {
   return p->widget.type == dt_token("slider") && p->type == dt_token("float") && p->cnt == 1;
 }
+static inline int is_wheel(const dt_ui_param_t *p)
+{ // colour wheel: rgb chroma + master, float[4]
+  return p->widget.type == dt_token("colwheel") && p->type == dt_token("float") && p->cnt == 4;
+}
+static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p); }
 
 static inline float param_get(int modid, int parid)
 {
@@ -108,7 +113,7 @@ static void build_menu_json(void)
     const char *nm = dt_token_str(g_graph.module[m].name);
     if(nm[0] && nm[1]=='-' && (nm[0]=='i' || nm[0]=='o')) continue; // skip input/output modules
     int has = 0;
-    for(int pi = 0; pi < so->num_params; pi++) if(is_radial_slider(so->param[pi])) { has = 1; break; }
+    for(int pi = 0; pi < so->num_params; pi++) if(is_editable(so->param[pi])) { has = 1; break; }
     if(!has) continue;
     if(!firstgrp) o += snprintf(o, e-o, ",");
     firstgrp = 0;
@@ -118,12 +123,20 @@ static void build_menu_json(void)
     for(int pi = 0; pi < so->num_params; pi++)
     {
       const dt_ui_param_t *p = so->param[pi];
-      if(!is_radial_slider(p)) continue;
+      if(!is_editable(p)) continue;
       if(!firstit) o += snprintf(o, e-o, ",");
       firstit = 0;
       o += snprintf(o, e-o, "{\"label\":\"");
       o = json_label(o, e, g_graph.module[m].name, p);
-      o += snprintf(o, e-o, "\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
+      if(is_wheel(p))
+      {
+        const float *c = (const float *)((uint8_t *)g_graph.module[m].param + p->offset);
+        const float *d = (const float *)p->val;
+        o += snprintf(o, e-o, "\",\"kind\":\"wheel\",\"parid\":%d,\"min\":%g,\"max\":%g,"
+            "\"def\":[%g,%g,%g,%g],\"cur\":[%g,%g,%g,%g]}",
+            pi, p->widget.min, p->widget.max, d[0],d[1],d[2],d[3], c[0],c[1],c[2],c[3]);
+      }
+      else o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
           pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
     }
     o += snprintf(o, e-o, "]}");
@@ -187,6 +200,32 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n);
       free(b);
       fprintf(stderr, "[srv] set %d:%d = %g  render %.1f ms  %zu B\n", modid, parid, v, ms, n);
+    }
+    return 1;
+  }
+
+  // vec4 set (colour wheels): "V <modid> <parid> <v0> <v1> <v2> <v3>"
+  float w[4];
+  if(sscanf(tmp, "V %d %d %f %f %f %f", &modid, &parid, w+0, w+1, w+2, w+3) == 6 &&
+     modid >= 0 && modid < g_graph.num_modules)
+  {
+    pthread_mutex_lock(&g_lock);
+    dt_module_t *m = g_graph.module + modid;
+    const dt_ui_param_t *p = m->so->param[parid];
+    float *val = (float *)((uint8_t *)m->param + p->offset);
+    float old0 = val[0];
+    for(int i=0;i<4;i++) val[i] = w[i];
+    dt_graph_run_t fl = s_graph_run_none;
+    if(m->so->check_params) fl = m->so->check_params(m, parid, 0, &old0);
+    g_graph.active_module = modid;
+    size_t n = 0; double ms = 0;
+    unsigned char *b = render_to_jpeg(&n, &ms, fl);
+    pthread_mutex_unlock(&g_lock);
+    if(b)
+    {
+      mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n);
+      free(b);
+      fprintf(stderr, "[srv] setvec %d:%d  render %.1f ms  %zu B\n", modid, parid, ms, n);
     }
   }
   return 1;
