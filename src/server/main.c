@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <setjmp.h>
+#include <jpeglib.h>
 
 static dt_graph_t      g_graph;
 static pthread_mutex_t g_lock   = PTHREAD_MUTEX_INITIALIZER;
@@ -251,6 +253,41 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   return 1;
 }
 
+// make a downscaled preview proxy in-process via libjpeg (scaled decode + encode).
+// no external process. the full-res source would otherwise be re-decoded per frame
+// (~400ms/12MP); editing the proxy keeps the loop fast. returns 0 on success.
+struct jpgerr_t { struct jpeg_error_mgr pub; jmp_buf jb; };
+static void jpg_err(j_common_ptr ci){ longjmp(((struct jpgerr_t*)ci->err)->jb, 1); }
+static int make_proxy(const char *in, const char *out, int maxdim)
+{
+  FILE *fi = fopen(in, "rb"); if(!fi) return 1;
+  struct jpeg_decompress_struct di; struct jpgerr_t de;
+  di.err = jpeg_std_error(&de.pub); de.pub.error_exit = jpg_err;
+  unsigned char *buf = 0; FILE *fo = 0;
+  if(setjmp(de.jb)) { jpeg_destroy_decompress(&di); if(fi)fclose(fi); if(fo)fclose(fo); free(buf); return 1; }
+  jpeg_create_decompress(&di); jpeg_stdio_src(&di, fi); jpeg_read_header(&di, TRUE);
+  int full = di.image_width > di.image_height ? di.image_width : di.image_height;
+  di.scale_num = 1; di.scale_denom = 1;            // libjpeg supports 1/2,1/4,1/8
+  while(di.scale_denom < 8 && full/(di.scale_denom*2) >= maxdim) di.scale_denom *= 2;
+  jpeg_start_decompress(&di);
+  const int w = di.output_width, h = di.output_height, c = di.output_components;
+  buf = malloc((size_t)w*h*c);
+  while(di.output_scanline < di.output_height){ unsigned char *row = buf + (size_t)di.output_scanline*w*c; jpeg_read_scanlines(&di, &row, 1); }
+  jpeg_finish_decompress(&di); jpeg_destroy_decompress(&di); fclose(fi); fi = 0;
+
+  fo = fopen(out, "wb"); if(!fo){ free(buf); return 1; }
+  struct jpeg_compress_struct co; struct jpgerr_t ce;
+  co.err = jpeg_std_error(&ce.pub); ce.pub.error_exit = jpg_err;
+  if(setjmp(ce.jb)) { jpeg_destroy_compress(&co); fclose(fo); free(buf); return 1; }
+  jpeg_create_compress(&co); jpeg_stdio_dest(&co, fo);
+  co.image_width = w; co.image_height = h; co.input_components = c;
+  co.in_color_space = c == 1 ? JCS_GRAYSCALE : JCS_RGB;
+  jpeg_set_defaults(&co); jpeg_set_quality(&co, 90, TRUE); jpeg_start_compress(&co, TRUE);
+  while(co.next_scanline < co.image_height){ unsigned char *row = buf + (size_t)co.next_scanline*w*c; jpeg_write_scanlines(&co, &row, 1); }
+  jpeg_finish_compress(&co); jpeg_destroy_compress(&co); fclose(fo); free(buf);
+  return 0;
+}
+
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char *argv[])
@@ -287,11 +324,7 @@ int main(int argc, char *argv[])
   if(image)
   {
     snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
-    char cmd[2400];
-    snprintf(cmd, sizeof(cmd),
-        "python3 -c 'from PIL import Image; im=Image.open(\"%s\"); "
-        "im.thumbnail((1600,1600)); im.save(\"%s\",quality=92)' 2>/dev/null", image, proxypath);
-    if(system(cmd) == 0 && access(proxypath, R_OK) == 0)
+    if(make_proxy(image, proxypath, 1600) == 0 && access(proxypath, R_OK) == 0)
     { use_image = proxypath; fprintf(stderr, "[srv] preview proxy %s <- %s\n", proxypath, image); }
     else fprintf(stderr, "[srv] proxy failed, full-res %s (slow)\n", image);
   }
