@@ -15,177 +15,131 @@
   #hud  { position:fixed; left:0; right:0; top:0; z-index:3; padding:6px 10px; pointer-events:none;
           font-variant-numeric:tabular-nums; color:#9fb; text-align:center; text-shadow:0 1px 3px #000; }
   #hud.bad { color:#e88; }
-  /* bottom strip: recently used sliders. subtle backdrop only behind the strip itself. */
-  #recents { position:fixed; left:0; right:0; bottom:0; z-index:2;
-             padding:10px 12px calc(10px + env(safe-area-inset-bottom));
-             display:flex; flex-direction:column; gap:8px;
-             background:linear-gradient(transparent, rgba(6,7,9,.92) 30%); }
-  #recents .head { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#778;
-                   text-shadow:0 1px 2px #000; }
-  .hint { color:#7a8; font-size:12px; padding:2px 0 4px; text-shadow:0 1px 2px #000; }
-  .row { display:flex; align-items:center; gap:10px; }
-  .row .lbl { width:90px; font-size:13px; color:#e6eaee; white-space:nowrap; overflow:hidden;
-              text-overflow:ellipsis; text-shadow:0 1px 2px #000; }
-  .row input { flex:1; height:34px; touch-action:none; accent-color:#6cf; }
-  .row .val { width:60px; text-align:right; font-size:13px; color:#bcd; font-variant-numeric:tabular-nums;
-              text-shadow:0 1px 2px #000; }
+  /* bottom button row — coexists with the radial (hold on the image) */
+  #bar { position:fixed; left:0; right:0; bottom:0; z-index:4; display:flex; gap:8px; align-items:center;
+         height:60px; padding:0 12px calc(0px + env(safe-area-inset-bottom));
+         overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch;
+         background:rgba(6,7,9,.92); border-top:1px solid rgba(255,255,255,.08); }
+  #bar::-webkit-scrollbar { display:none; }
+  .btn { flex:0 0 auto; padding:9px 14px; border-radius:18px; font-size:13px; white-space:nowrap;
+         background:#1b1e25; color:#cdd; border:1px solid rgba(255,255,255,.08); }
+  .btn.active { background:#2b6fd0; color:#fff; border-color:#3b7fe0; }
+  .btn .mod { color:#789; font-size:11px; margin-right:5px; }
 </style>
 </head>
 <body>
 <canvas id="img"></canvas>
 <canvas id="menu"></canvas>
 <div id="hud">connecting…</div>
-<div id="recents"></div>
+<div id="bar"></div>
 <script>
 "use strict";
-const imgC = document.getElementById('img'), ictx = imgC.getContext('2d', {alpha:false});
-const ovr  = document.getElementById('menu'), octx = ovr.getContext('2d');
-const hud  = document.getElementById('hud'), recEl = document.getElementById('recents');
-
-let ws, sentAt = 0, inFlight = false, queued = null, ema = 0;
-let groups = [];
+const imgC=document.getElementById('img'), ictx=imgC.getContext('2d',{alpha:false});
+const ovr=document.getElementById('menu'), octx=ovr.getContext('2d');
+const hud=document.getElementById('hud'), bar=document.getElementById('bar');
+let ws, sentAt=0, inFlight=false, queued=null, ema=0, groups=[];
 
 // ---- websocket ----
 function connect(){
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = 'blob';
-  ws.onopen  = () => { hud.className=''; hud.textContent = 'hold to edit'; };
-  ws.onclose = () => { hud.className='bad'; hud.textContent = 'reconnecting…'; setTimeout(connect, 1000); };
-  ws.onerror = () => ws.close();
-  ws.onmessage = async (e) => {
-    if(typeof e.data === 'string'){ try{ const m=JSON.parse(e.data); groups=m.groups||[]; }catch(_){} return; }
-    const rtt = performance.now() - sentAt;
-    const bmp = await createImageBitmap(e.data);
-    fitCanvas(imgC); ictx.imageSmoothingQuality='high';
-    drawContain(ictx, bmp, imgC.width, imgC.height); bmp.close();
-    ema = ema ? ema*0.8+rtt*0.2 : rtt;
-    if(state===ST.IDLE) hud.textContent = `${rtt.toFixed(0)} ms · hold to edit`;
-    inFlight = false;
-    if(queued!==null){ const q=queued; queued=null; sendParam(q.g,q.p,q.v); }
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(`${proto}://${location.host}/ws`); ws.binaryType='blob';
+  ws.onopen=()=>{ hud.className=''; hud.textContent='hold to edit · or tap a control'; };
+  ws.onclose=()=>{ hud.className='bad'; hud.textContent='reconnecting…'; setTimeout(connect,1000); };
+  ws.onerror=()=>ws.close();
+  ws.onmessage=async e=>{
+    if(typeof e.data==='string'){ try{ groups=JSON.parse(e.data).groups||[]; buildBar(); }catch(_){} return; }
+    const rtt=performance.now()-sentAt;
+    const bmp=await createImageBitmap(e.data);
+    fitCanvas(imgC); ictx.imageSmoothingQuality='high'; drawContain(ictx,bmp,imgC.width,imgC.height); bmp.close();
+    ema=ema?ema*0.8+rtt*0.2:rtt;
+    if(state===ST.IDLE) hud.textContent=`${rtt.toFixed(0)} ms · hold or tap`;
+    inFlight=false; if(queued!==null){ const q=queued; queued=null; sendParam(q.g,q.p,q.v); }
   };
 }
-function sendParam(gi, pi, v){
-  const it = groups[gi].items[pi];
-  it.cur = v;
-  syncRecent(gi, pi);
-  if(!ws || ws.readyState!==1) return;
+function sendParam(gi,pi,v){
+  const it=groups[gi].items[pi]; it.cur=v;
+  if(!ws||ws.readyState!==1) return;
   if(inFlight){ queued={g:gi,p:pi,v}; return; }
-  inFlight = true; sentAt = performance.now();
-  ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`);
+  inFlight=true; sentAt=performance.now(); ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`);
+}
+function fitCanvas(c){ const d=devicePixelRatio||1,w=innerWidth*d|0,h=innerHeight*d|0; if(c.width!==w||c.height!==h){c.width=w;c.height=h;} }
+function drawContain(ctx,bmp,W,H){ const s=Math.min(W/bmp.width,H/bmp.height),w=bmp.width*s,h=bmp.height*s;
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H); ctx.drawImage(bmp,(W-w)/2,(H-h)/2,w,h); }
+
+// ---- bottom button bar ----
+function buildBar(){
+  bar.innerHTML='';
+  groups.forEach((g,gi)=> g.items.forEach((it,pi)=>{
+    const b=document.createElement('div'); b.className='btn'; b.dataset.gi=gi; b.dataset.pi=pi;
+    b.innerHTML=`<span class="mod">${g.label}</span>${it.label}`;
+    b.addEventListener('click',()=>enterValue(gi,pi));
+    bar.append(b);
+  }));
+}
+function markActive(gi,pi){
+  document.querySelectorAll('.btn.active').forEach(b=>b.classList.remove('active'));
+  if(gi>=0){ const b=bar.querySelector(`.btn[data-gi="${gi}"][data-pi="${pi}"]`); if(b){ b.classList.add('active');
+    b.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'}); } }
 }
 
-// ---- canvas helpers ----
-function fitCanvas(c){ const d=devicePixelRatio||1, w=innerWidth*d|0, h=innerHeight*d|0;
-  if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } }
-function drawContain(ctx, bmp, W, H){
-  const s=Math.min(W/bmp.width, H/bmp.height), w=bmp.width*s, h=bmp.height*s;
-  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
-  ctx.drawImage(bmp, (W-w)/2, (H-h)/2, w, h);
-}
+// ---- shared value scrub (drag anywhere — no need to hit a slider) ----
+const ST={ IDLE:0, GROUPS:1, PARAMS:2, VALUE:3 };
+let state=ST.IDLE, cx=0, cy=0, curGroup=-1, hover=-1;
+let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1, scrubbing=false;
+const R =()=>Math.min(innerWidth,innerHeight)*0.34, R0=()=>R()*0.4;
 
-// ---- recently used sliders (bottom strip) ----
-let recents = []; // [{gi,pi,el,input,val}]
-function addRecent(gi, pi){
-  recents = recents.filter(r => !(r.gi===gi && r.pi===pi));
-  recents.unshift({gi,pi});
-  recents = recents.slice(0, 5);
-  renderRecents();
-}
-function syncRecent(gi, pi){ // update the slider widget if this param is in the strip
-  const r = recents.find(r => r.gi===gi && r.pi===pi);
-  if(r && r.input){ const it=groups[gi].items[pi]; r.input.value=it.cur; r.val.textContent=it.cur.toFixed(3); }
-}
-function renderRecents(){
-  recEl.innerHTML='';
-  const head=document.createElement('div'); head.className='head'; head.textContent='recent'; recEl.append(head);
-  if(!recents.length){
-    const h=document.createElement('div'); h.className='hint';
-    h.textContent='hold on the image to pick a control — used sliders collect here';
-    recEl.append(h); return;
-  }
-  for(const r of recents){
-    const it = groups[r.gi].items[r.pi];
-    const row=document.createElement('div'); row.className='row';
-    const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent=it.label;
-    const inp=document.createElement('input'); inp.type='range';
-    inp.min=it.min; inp.max=it.max; inp.step=(it.max-it.min)/1000||0.001; inp.value=it.cur;
-    const val=document.createElement('span'); val.className='val'; val.textContent=it.cur.toFixed(3);
-    inp.addEventListener('input', ()=>{ const v=+inp.value; val.textContent=v.toFixed(3); sendParam(r.gi,r.pi,v); });
-    row.append(lbl,inp,val); recEl.append(row);
-    r.el=row; r.input=inp; r.val=val;
-  }
-}
+function enterValue(gi,pi){ valGI=gi; valPI=pi; valItem=groups[gi].items[pi]; state=ST.VALUE; scrubbing=false;
+  markActive(gi,pi); drawOverlay(); hud.textContent=`${valItem.label} — drag anywhere`; }
 
-// ---- radial marking menu ----
-const ST = { IDLE:0, GROUPS:1, PARAMS:2, VALUE:3 };
-let state = ST.IDLE;
-let cx=0, cy=0, curGroup=-1, hover=-1;
-let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1;
-const R  = () => Math.min(innerWidth, innerHeight) * 0.34;
-const R0 = () => R() * 0.4;
+function ringItems(){ if(state===ST.GROUPS) return groups.map(g=>g.label);
+  if(state===ST.PARAMS) return groups[curGroup].items.map(it=>it.label); return []; }
+function pick(x,y){ const dx=x-cx,dy=y-cy,n=ringItems().length;
+  if(!n||dx*dx+dy*dy<R0()*R0()) return -1;
+  return Math.min(n-1, Math.floor((Math.atan2(dy,dx)+Math.PI)/(2*Math.PI/n))); }
 
-function ringItems(){
-  if(state===ST.GROUPS) return groups.map(g=>g.label);
-  if(state===ST.PARAMS) return groups[curGroup].items.map(it=>it.label);
-  return [];
-}
-function pick(x,y){
-  const dx=x-cx, dy=y-cy, n=ringItems().length;
-  if(!n || dx*dx+dy*dy < R0()*R0()) return -1;
-  const a = Math.atan2(dy,dx) + Math.PI;
-  return Math.min(n-1, Math.floor(a / (2*Math.PI/n)));
-}
 function drawOverlay(){
-  fitCanvas(ovr);
-  const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
-  octx.clearRect(0,0,innerWidth,innerHeight);   // NO full-screen dimming of the image
+  fitCanvas(ovr); const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
+  octx.clearRect(0,0,innerWidth,innerHeight);
   if(state===ST.IDLE) return;
-
   if(state===ST.VALUE){
     const it=valItem, frac=Math.max(0,Math.min(1,(it.cur-it.min)/(it.max-it.min)));
-    const y=innerHeight*0.42, m=40, w=innerWidth-2*m;
+    const y=innerHeight*0.40, m=40, w=innerWidth-2*m;
     octx.strokeStyle='rgba(255,255,255,.35)'; octx.lineWidth=4; octx.lineCap='round';
     octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w,y); octx.stroke();
     octx.strokeStyle='#6cf'; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w*frac,y); octx.stroke();
     octx.fillStyle='#6cf'; octx.beginPath(); octx.arc(m+w*frac,y,12,0,7); octx.fill();
-    octx.fillStyle='#fff'; octx.textAlign='center'; octx.font='600 20px system-ui';
-    octx.shadowColor='#000'; octx.shadowBlur=4;
+    octx.fillStyle='#fff'; octx.textAlign='center'; octx.font='600 20px system-ui'; octx.shadowColor='#000'; octx.shadowBlur=4;
     octx.fillText(`${it.label}   ${it.cur.toFixed(3)}`, innerWidth/2, y-28);
+    octx.font='13px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag anywhere · release to apply', innerWidth/2, y+34);
     octx.shadowBlur=0; return;
   }
-
   const items=ringItems(), n=items.length, r=R(), seg=2*Math.PI/n;
   for(let i=0;i<n;i++){
     const a0=i*seg-Math.PI, a1=a0+seg, mid=a0+seg/2;
     octx.beginPath(); octx.moveTo(cx+Math.cos(a0)*R0(), cy+Math.sin(a0)*R0());
     octx.arc(cx,cy,r,a0,a1); octx.arc(cx,cy,R0(),a1,a0,true); octx.closePath();
-    octx.fillStyle = (i===hover) ? 'rgba(80,150,230,.92)' : 'rgba(24,26,32,.82)';
-    octx.fill(); octx.strokeStyle='rgba(255,255,255,.14)'; octx.lineWidth=1; octx.stroke();
-    octx.fillStyle = (i===hover)?'#fff':'#cdd'; octx.textAlign='center'; octx.textBaseline='middle';
+    octx.fillStyle=(i===hover)?'rgba(80,150,230,.92)':'rgba(24,26,32,.82)'; octx.fill();
+    octx.strokeStyle='rgba(255,255,255,.14)'; octx.lineWidth=1; octx.stroke();
+    octx.fillStyle=(i===hover)?'#fff':'#cdd'; octx.textAlign='center'; octx.textBaseline='middle';
     octx.font=(i===hover?'600 ':'')+'13px system-ui';
     octx.fillText(items[i], cx+Math.cos(mid)*r*0.72, cy+Math.sin(mid)*r*0.72);
   }
   octx.fillStyle='#9ab'; octx.textAlign='center'; octx.textBaseline='middle'; octx.font='12px system-ui';
   octx.fillText(state===ST.GROUPS?'module':groups[curGroup].label, cx, cy);
 }
-function pos(e){ return {x:e.clientX, y:e.clientY}; }
+const pos=e=>({x:e.clientX,y:e.clientY});
 
 ovr.addEventListener('pointerdown', e=>{
   ovr.setPointerCapture(e.pointerId); const p=pos(e);
-  if(state===ST.IDLE || state===ST.GROUPS || state===ST.PARAMS){
-    cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay();
-  } else if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; }
+  if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; }
+  else { cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay(); }
 });
 ovr.addEventListener('pointermove', e=>{
   if(state===ST.IDLE) return; const p=pos(e);
   if(state===ST.VALUE){
-    if(e.buttons||e.pressure>0){
-      const range=valItem.max-valItem.min;
-      let v=valBase + ((p.x-valStartX)/(innerWidth*0.8))*range;
-      v=Math.max(valItem.min, Math.min(valItem.max, v));
-      sendParam(valGI, valPI, v); drawOverlay();
-    }
+    if(scrubbing){ const range=valItem.max-valItem.min;
+      let v=valBase+((p.x-valStartX)/(innerWidth*0.8))*range;
+      v=Math.max(valItem.min,Math.min(valItem.max,v)); sendParam(valGI,valPI,v); drawOverlay(); }
     return;
   }
   hover=pick(p.x,p.y); drawOverlay();
@@ -193,16 +147,12 @@ ovr.addEventListener('pointermove', e=>{
 ovr.addEventListener('pointerup', e=>{
   const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
   if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
-  else if(state===ST.PARAMS){
-    if(sel>=0){ valItem=groups[curGroup].items[sel]; valGI=curGroup; valPI=sel; state=ST.VALUE; addRecent(curGroup,sel); }
-    else state=ST.IDLE;
-  }
-  else if(state===ST.VALUE){ state=ST.IDLE; hud.textContent='hold to edit'; }
+  else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
+  else if(state===ST.VALUE){ scrubbing=false; state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
   drawOverlay();
 });
 
 addEventListener('resize', ()=>{ if(state!==ST.IDLE) drawOverlay(); });
-renderRecents();   // show the (empty) recent strip with its hint on load
 connect();
 </script>
 </body>
