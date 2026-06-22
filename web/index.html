@@ -50,7 +50,7 @@ function connect(){
     if(typeof e.data==='string'){ try{ groups=JSON.parse(e.data).groups||[]; buildBar(); }catch(_){} return; }
     const rtt=performance.now()-sentAt;
     const bmp=await createImageBitmap(e.data);
-    fitCanvas(imgC); ictx.imageSmoothingQuality='high'; drawContain(ictx,bmp,imgC.width,imgC.height); bmp.close();
+    if(lastBmp) lastBmp.close(); lastBmp=bmp; drawView();   // keep current zoom/pan across frames
     ema=ema?ema*0.8+rtt*0.2:rtt;
     if(state===ST.IDLE) hud.textContent=`${rtt.toFixed(0)} ms · hold or tap`;
     inFlight=false; if(queued!==null){ const q=queued; queued=null; sendParam(q.g,q.p,q.v); }
@@ -63,8 +63,17 @@ function sendParam(gi,pi,v){
   inFlight=true; sentAt=performance.now(); ws.send(`P ${groups[gi].modid} ${it.parid} ${v}`);
 }
 function fitCanvas(c){ const d=devicePixelRatio||1,w=innerWidth*d|0,h=innerHeight*d|0; if(c.width!==w||c.height!==h){c.width=w;c.height=h;} }
-function drawContain(ctx,bmp,W,H){ const s=Math.min(W/bmp.width,H/bmp.height),w=bmp.width*s,h=bmp.height*s;
-  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H); ctx.drawImage(bmp,(W-w)/2,(H-h)/2,w,h); }
+// view = zoom/pan over the received preview bitmap (tx/ty in CSS px, scale>=1)
+let lastBmp=null, view={scale:1, tx:0, ty:0};
+function drawView(){
+  if(!lastBmp) return;
+  fitCanvas(imgC);
+  const d=devicePixelRatio||1, W=imgC.width, H=imgC.height;
+  const base=Math.min(W/lastBmp.width, H/lastBmp.height)*view.scale, w=lastBmp.width*base, h=lastBmp.height*base;
+  ictx.setTransform(1,0,0,1,0,0); ictx.fillStyle='#000'; ictx.fillRect(0,0,W,H);
+  ictx.imageSmoothingQuality='high';
+  ictx.drawImage(lastBmp, (W-w)/2 + view.tx*d, (H-h)/2 + view.ty*d, w, h);
+}
 
 // ---- bottom button bar ----
 function buildBar(){
@@ -136,30 +145,58 @@ function drawOverlay(){
 }
 const pos=e=>({x:e.clientX,y:e.clientY});
 
+// ---- pinch zoom / 2-finger pan — kept strictly separate from the radial ----
+const pointers=new Map();
+let pinch=null, blockRadial=false;
+function startPinch(){ const v=[...pointers.values()],a=v[0],b=v[1]; if(!a||!b) return;
+  pinch={ d:Math.hypot(a.x-b.x,a.y-b.y)||1, mx:(a.x+b.x)/2, my:(a.y+b.y)/2, view:{...view} }; }
+function updatePinch(){ const v=[...pointers.values()],a=v[0],b=v[1]; if(!a||!b||!pinch||!lastBmp) return;
+  const d=Math.hypot(a.x-b.x,a.y-b.y), mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+  const ns=Math.max(1, Math.min(8, pinch.view.scale*(d/pinch.d)));
+  const base=Math.min(innerWidth/lastBmp.width, innerHeight/lastBmp.height);
+  const sS=base*pinch.view.scale, nS=base*ns;
+  const c0x=(pinch.mx-(innerWidth/2+pinch.view.tx))/sS, c0y=(pinch.my-(innerHeight/2+pinch.view.ty))/sS;
+  view.scale=ns; view.tx=mx-innerWidth/2-c0x*nS; view.ty=my-innerHeight/2-c0y*nS;
+  if(ns<=1.001){ view.tx=0; view.ty=0; }   // snap back to fit
+  drawView();
+}
+
 ovr.addEventListener('pointerdown', e=>{
-  ovr.setPointerCapture(e.pointerId); const p=pos(e);
+  ovr.setPointerCapture(e.pointerId); pointers.set(e.pointerId, pos(e));
+  if(pointers.size>=2){ blockRadial=true; if(state!==ST.IDLE){ state=ST.IDLE; markActive(-1); drawOverlay(); } startPinch(); return; }
+  if(blockRadial) return;
+  const p=pos(e);
   if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; }
   else { cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay(); }
 });
 ovr.addEventListener('pointermove', e=>{
-  if(state===ST.IDLE) return; const p=pos(e);
+  if(pointers.has(e.pointerId)) pointers.set(e.pointerId, pos(e));
+  if(pointers.size>=2){ updatePinch(); return; }
+  if(blockRadial || state===ST.IDLE) return;
+  const p=pos(e);
   if(state===ST.VALUE){
     if(scrubbing){ const range=valItem.max-valItem.min;
-      let v=valBase+((p.x-valStartX)/(innerWidth*0.8))*range;
-      v=Math.max(valItem.min,Math.min(valItem.max,v)); sendParam(valGI,valPI,v); drawOverlay(); }
+      let val=valBase+((p.x-valStartX)/(innerWidth*0.8))*range;
+      val=Math.max(valItem.min,Math.min(valItem.max,val)); sendParam(valGI,valPI,val); drawOverlay(); }
     return;
   }
   hover=pick(p.x,p.y); drawOverlay();
 });
-ovr.addEventListener('pointerup', e=>{
+function endPointer(e){
+  pointers.delete(e.pointerId);
+  if(pointers.size>=2){ startPinch(); return; }       // still pinching with remaining fingers
+  if(pointers.size===1){ pinch=null; return; }         // one finger left after pinch — wait for full release
+  if(blockRadial){ blockRadial=false; pinch=null; return; }
   const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
   if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
   else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
   else if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI); state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
   drawOverlay();
-});
+}
+ovr.addEventListener('pointerup', endPointer);
+ovr.addEventListener('pointercancel', endPointer);
 
-addEventListener('resize', ()=>{ if(state!==ST.IDLE) drawOverlay(); });
+addEventListener('resize', ()=>{ drawView(); if(state!==ST.IDLE) drawOverlay(); });
 connect();
 </script>
 </body>
