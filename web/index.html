@@ -10,26 +10,38 @@
               font:14px/1.3 system-ui, sans-serif; -webkit-user-select:none; user-select:none;
               -webkit-tap-highlight-color:transparent; }
   #img, #menu { position:fixed; inset:0; width:100%; height:100%; }
-  #img  { object-fit:contain; background:#000; touch-action:none; }
-  #menu { touch-action:none; }
-  #hud  { position:fixed; left:0; right:0; bottom:0; padding:6px 10px calc(6px + env(safe-area-inset-bottom));
-          font-variant-numeric:tabular-nums; color:#7d8; text-align:center; pointer-events:none;
-          text-shadow:0 1px 3px #000; }
+  #img  { object-fit:contain; background:#000; }
+  #menu { touch-action:none; z-index:1; }
+  #hud  { position:fixed; left:0; right:0; top:0; z-index:3; padding:6px 10px; pointer-events:none;
+          font-variant-numeric:tabular-nums; color:#9fb; text-align:center; text-shadow:0 1px 3px #000; }
   #hud.bad { color:#e88; }
+  /* bottom strip: recently used sliders. subtle backdrop only behind the strip itself. */
+  #recents { position:fixed; left:0; right:0; bottom:0; z-index:2;
+             padding:10px 12px calc(10px + env(safe-area-inset-bottom));
+             display:flex; flex-direction:column; gap:7px;
+             background:linear-gradient(transparent, rgba(8,8,10,.78) 38%); }
+  #recents:empty { display:none; }
+  .row { display:flex; align-items:center; gap:10px; }
+  .row .lbl { width:84px; font-size:12px; color:#cdd; white-space:nowrap; overflow:hidden;
+              text-overflow:ellipsis; text-shadow:0 1px 2px #000; }
+  .row input { flex:1; height:30px; touch-action:none; }
+  .row .val { width:58px; text-align:right; font-size:12px; color:#9ab; font-variant-numeric:tabular-nums;
+              text-shadow:0 1px 2px #000; }
 </style>
 </head>
 <body>
 <canvas id="img"></canvas>
 <canvas id="menu"></canvas>
 <div id="hud">connecting…</div>
+<div id="recents"></div>
 <script>
 "use strict";
 const imgC = document.getElementById('img'), ictx = imgC.getContext('2d', {alpha:false});
 const ovr  = document.getElementById('menu'), octx = ovr.getContext('2d');
-const hud  = document.getElementById('hud');
+const hud  = document.getElementById('hud'), recEl = document.getElementById('recents');
 
 let ws, sentAt = 0, inFlight = false, queued = null, ema = 0;
-let groups = [], presets = [];
+let groups = [];
 
 // ---- websocket ----
 function connect(){
@@ -40,7 +52,7 @@ function connect(){
   ws.onclose = () => { hud.className='bad'; hud.textContent = 'reconnecting…'; setTimeout(connect, 1000); };
   ws.onerror = () => ws.close();
   ws.onmessage = async (e) => {
-    if(typeof e.data === 'string'){ try{ const m=JSON.parse(e.data); groups=m.groups||[]; presets=m.presets||[]; }catch(_){} return; }
+    if(typeof e.data === 'string'){ try{ const m=JSON.parse(e.data); groups=m.groups||[]; }catch(_){} return; }
     const rtt = performance.now() - sentAt;
     const bmp = await createImageBitmap(e.data);
     fitCanvas(imgC); ictx.imageSmoothingQuality='high';
@@ -54,6 +66,7 @@ function connect(){
 function sendParam(gi, pi, v){
   const it = groups[gi].items[pi];
   it.cur = v;
+  syncRecent(gi, pi);
   if(!ws || ws.readyState!==1) return;
   if(inFlight){ queued={g:gi,p:pi,v}; return; }
   inFlight = true; sentAt = performance.now();
@@ -64,18 +77,44 @@ function sendParam(gi, pi, v){
 function fitCanvas(c){ const d=devicePixelRatio||1, w=innerWidth*d|0, h=innerHeight*d|0;
   if(c.width!==w||c.height!==h){ c.width=w; c.height=h; } }
 function drawContain(ctx, bmp, W, H){
-  const s = Math.min(W/bmp.width, H/bmp.height), w=bmp.width*s, h=bmp.height*s;
+  const s=Math.min(W/bmp.width, H/bmp.height), w=bmp.width*s, h=bmp.height*s;
   ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
   ctx.drawImage(bmp, (W-w)/2, (H-h)/2, w, h);
 }
 
-// ---- radial interaction ----
+// ---- recently used sliders (bottom strip) ----
+let recents = []; // [{gi,pi,el,input,val}]
+function addRecent(gi, pi){
+  recents = recents.filter(r => !(r.gi===gi && r.pi===pi));
+  recents.unshift({gi,pi});
+  recents = recents.slice(0, 5);
+  renderRecents();
+}
+function syncRecent(gi, pi){ // update the slider widget if this param is in the strip
+  const r = recents.find(r => r.gi===gi && r.pi===pi);
+  if(r && r.input){ const it=groups[gi].items[pi]; r.input.value=it.cur; r.val.textContent=it.cur.toFixed(3); }
+}
+function renderRecents(){
+  recEl.innerHTML='';
+  for(const r of recents){
+    const it = groups[r.gi].items[r.pi];
+    const row=document.createElement('div'); row.className='row';
+    const lbl=document.createElement('span'); lbl.className='lbl'; lbl.textContent=it.label;
+    const inp=document.createElement('input'); inp.type='range';
+    inp.min=it.min; inp.max=it.max; inp.step=(it.max-it.min)/1000||0.001; inp.value=it.cur;
+    const val=document.createElement('span'); val.className='val'; val.textContent=it.cur.toFixed(3);
+    inp.addEventListener('input', ()=>{ const v=+inp.value; val.textContent=v.toFixed(3); sendParam(r.gi,r.pi,v); });
+    row.append(lbl,inp,val); recEl.append(row);
+    r.el=row; r.input=inp; r.val=val;
+  }
+}
+
+// ---- radial marking menu ----
 const ST = { IDLE:0, GROUPS:1, PARAMS:2, VALUE:3 };
 let state = ST.IDLE;
-let cx=0, cy=0;           // ring center (css px)
-let curGroup=-1, curItem=-1, hover=-1;
+let cx=0, cy=0, curGroup=-1, hover=-1;
 let valStartX=0, valBase=0, valItem=null, valGI=-1, valPI=-1;
-const R = () => Math.min(innerWidth, innerHeight) * 0.34;
+const R  = () => Math.min(innerWidth, innerHeight) * 0.34;
 const R0 = () => R() * 0.4;
 
 function ringItems(){
@@ -86,65 +125,58 @@ function ringItems(){
 function pick(x,y){
   const dx=x-cx, dy=y-cy, n=ringItems().length;
   if(!n || dx*dx+dy*dy < R0()*R0()) return -1;
-  let a = Math.atan2(dy,dx) + Math.PI;          // 0..2pi from -x axis
+  const a = Math.atan2(dy,dx) + Math.PI;
   return Math.min(n-1, Math.floor(a / (2*Math.PI/n)));
 }
-
 function drawOverlay(){
   fitCanvas(ovr);
   const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
-  octx.clearRect(0,0,innerWidth,innerHeight);
+  octx.clearRect(0,0,innerWidth,innerHeight);   // NO full-screen dimming of the image
   if(state===ST.IDLE) return;
 
   if(state===ST.VALUE){
-    const it=valItem, frac=(it.cur-it.min)/(it.max-it.min);
-    const y=innerHeight*0.5, m=40, w=innerWidth-2*m;
-    octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,innerWidth,innerHeight);
-    octx.strokeStyle='#444'; octx.lineWidth=4; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w,y); octx.stroke();
-    octx.strokeStyle='#6cf'; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w*Math.max(0,Math.min(1,frac)),y); octx.stroke();
-    octx.fillStyle='#6cf'; octx.beginPath(); octx.arc(m+w*Math.max(0,Math.min(1,frac)),y,12,0,7); octx.fill();
+    const it=valItem, frac=Math.max(0,Math.min(1,(it.cur-it.min)/(it.max-it.min)));
+    const y=innerHeight*0.42, m=40, w=innerWidth-2*m;
+    octx.strokeStyle='rgba(255,255,255,.35)'; octx.lineWidth=4; octx.lineCap='round';
+    octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w,y); octx.stroke();
+    octx.strokeStyle='#6cf'; octx.beginPath(); octx.moveTo(m,y); octx.lineTo(m+w*frac,y); octx.stroke();
+    octx.fillStyle='#6cf'; octx.beginPath(); octx.arc(m+w*frac,y,12,0,7); octx.fill();
     octx.fillStyle='#fff'; octx.textAlign='center'; octx.font='600 20px system-ui';
-    octx.fillText(`${it.label}   ${it.cur.toFixed(3)}`, innerWidth/2, y-30);
-    octx.fillStyle='#999'; octx.font='13px system-ui';
-    octx.fillText('drag to adjust · release to apply', innerWidth/2, y+34);
-    return;
+    octx.shadowColor='#000'; octx.shadowBlur=4;
+    octx.fillText(`${it.label}   ${it.cur.toFixed(3)}`, innerWidth/2, y-28);
+    octx.shadowBlur=0; return;
   }
 
   const items=ringItems(), n=items.length, r=R(), seg=2*Math.PI/n;
-  octx.fillStyle='rgba(0,0,0,.4)'; octx.fillRect(0,0,innerWidth,innerHeight);
   for(let i=0;i<n;i++){
     const a0=i*seg-Math.PI, a1=a0+seg, mid=a0+seg/2;
     octx.beginPath(); octx.moveTo(cx+Math.cos(a0)*R0(), cy+Math.sin(a0)*R0());
     octx.arc(cx,cy,r,a0,a1); octx.arc(cx,cy,R0(),a1,a0,true); octx.closePath();
-    octx.fillStyle = (i===hover) ? 'rgba(80,150,230,.85)' : 'rgba(30,32,38,.85)';
-    octx.fill(); octx.strokeStyle='rgba(255,255,255,.12)'; octx.lineWidth=1; octx.stroke();
+    octx.fillStyle = (i===hover) ? 'rgba(80,150,230,.92)' : 'rgba(24,26,32,.82)';
+    octx.fill(); octx.strokeStyle='rgba(255,255,255,.14)'; octx.lineWidth=1; octx.stroke();
     octx.fillStyle = (i===hover)?'#fff':'#cdd'; octx.textAlign='center'; octx.textBaseline='middle';
     octx.font=(i===hover?'600 ':'')+'13px system-ui';
     octx.fillText(items[i], cx+Math.cos(mid)*r*0.72, cy+Math.sin(mid)*r*0.72);
   }
-  octx.fillStyle='#888'; octx.textAlign='center'; octx.textBaseline='middle'; octx.font='12px system-ui';
+  octx.fillStyle='#9ab'; octx.textAlign='center'; octx.textBaseline='middle'; octx.font='12px system-ui';
   octx.fillText(state===ST.GROUPS?'module':groups[curGroup].label, cx, cy);
 }
-
 function pos(e){ return {x:e.clientX, y:e.clientY}; }
 
 ovr.addEventListener('pointerdown', e=>{
   ovr.setPointerCapture(e.pointerId); const p=pos(e);
   if(state===ST.IDLE || state===ST.GROUPS || state===ST.PARAMS){
     cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay();
-  } else if(state===ST.VALUE){
-    valStartX=p.x; valBase=valItem.cur; drawOverlay();
-  }
+  } else if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; }
 });
 ovr.addEventListener('pointermove', e=>{
   if(state===ST.IDLE) return; const p=pos(e);
   if(state===ST.VALUE){
     if(e.buttons||e.pressure>0){
-      const range=valItem.max-valItem.min, dx=p.x-valStartX;
-      let v=valBase + (dx/(innerWidth*0.8))*range;
+      const range=valItem.max-valItem.min;
+      let v=valBase + ((p.x-valStartX)/(innerWidth*0.8))*range;
       v=Math.max(valItem.min, Math.min(valItem.max, v));
       sendParam(valGI, valPI, v); drawOverlay();
-      hud.textContent=`${valItem.label} ${v.toFixed(3)}`;
     }
     return;
   }
@@ -152,15 +184,12 @@ ovr.addEventListener('pointermove', e=>{
 });
 ovr.addEventListener('pointerup', e=>{
   const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
-  if(state===ST.GROUPS){
-    if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; }
+  if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
+  else if(state===ST.PARAMS){
+    if(sel>=0){ valItem=groups[curGroup].items[sel]; valGI=curGroup; valPI=sel; state=ST.VALUE; addRecent(curGroup,sel); }
     else state=ST.IDLE;
-  } else if(state===ST.PARAMS){
-    if(sel>=0){ curItem=sel; valItem=groups[curGroup].items[sel]; valGI=curGroup; valPI=sel; state=ST.VALUE; }
-    else state=ST.IDLE;
-  } else if(state===ST.VALUE){
-    state=ST.IDLE; hud.textContent='hold to edit';
   }
+  else if(state===ST.VALUE){ state=ST.IDLE; hud.textContent='hold to edit'; }
   drawOverlay();
 });
 
