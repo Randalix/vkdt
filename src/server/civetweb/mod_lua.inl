@@ -10,8 +10,6 @@
 #include "civetweb_lua.h"
 #include "civetweb_private_lua.h"
 
-/* Prototypes */
-static int lua_error_handler(lua_State *L);
 
 #if defined(_WIN32)
 static void *
@@ -643,26 +641,14 @@ run_lsp_kepler(struct mg_connection *conn,
 		/* Only send a HTML header, if this is the top level page.
 		 * If this page is included by some mg.include calls, do not add a
 		 * header. */
-
-		/* Initialize a new HTTP response, either with some-predefined
-		 * status code (e.g. 404 if this is called from an error
-		 * handler) or with 200 OK */
-		mg_response_header_start(conn,
-		                         conn->status_code > 0 ? conn->status_code
-		                                               : 200);
-
-		/* Add additional headers */
+		mg_printf(conn, "HTTP/1.1 200 OK\r\n");
 		send_no_cache_header(conn);
 		send_additional_header(conn);
-
-		/* Add content type */
-		mg_response_header_add(conn,
-		                       "Content-Type",
-		                       "text/html; charset=utf-8",
-		                       -1);
-
-		/* Send the HTTP response (status and all headers) */
-		mg_response_header_send(conn);
+		mg_printf(conn,
+		          "Date: %s\r\n"
+		          "Connection: close\r\n"
+		          "Content-Type: text/html; charset=utf-8\r\n\r\n",
+		          date);
 	}
 
 	data.begin = p;
@@ -676,18 +662,11 @@ run_lsp_kepler(struct mg_connection *conn,
 		/* Syntax error or OOM.
 		 * Error message is pushed on stack. */
 		lua_pcall(L, 1, 0, 0);
-		lua_cry(conn, lua_ok, L, "LSP Kepler", "execute");
-		lua_error_handler(L);
-		return 1;
+		lua_cry(conn, lua_ok, L, "LSP", "execute"); /* XXX TODO: everywhere ! */
 
 	} else {
 		/* Success loading chunk. Call it. */
-		lua_ok = lua_pcall(L, 0, 0, 0);
-		if (lua_ok != LUA_OK) {
-			lua_cry(conn, lua_ok, L, "LSP Kepler", "call");
-			lua_error_handler(L);
-			return 1;
-		}
+		lua_pcall(L, 0, 0, 1);
 	}
 	return 0;
 }
@@ -801,17 +780,9 @@ run_lsp_civetweb(struct mg_connection *conn,
 						/* Syntax error or OOM.
 						 * Error message is pushed on stack. */
 						lua_pcall(L, 1, 0, 0);
-						lua_cry(conn, lua_ok, L, "LSP", "execute");
-						lua_error_handler(L);
-						return 1;
 					} else {
 						/* Success loading chunk. Call it. */
-						lua_ok = lua_pcall(L, 0, 0, 0);
-						if (lua_ok != LUA_OK) {
-							lua_cry(conn, lua_ok, L, "LSP", "call");
-							lua_error_handler(L);
-							return 1;
-						}
+						lua_pcall(L, 0, 0, 1);
 					}
 
 					/* Progress until after the Lua closing tag. */
@@ -1977,9 +1948,6 @@ struct lua_websock_data {
 	struct mg_connection *conn[MAX_WORKER_THREADS];
 	pthread_mutex_t ws_mutex;
 };
-#else
-/* used in parameter list of prepare_lua_environment() */
-struct lua_websock_data;
 #endif
 
 
@@ -2698,15 +2666,8 @@ static void
 civetweb_open_lua_libs(lua_State *L)
 {
 	{
-#if LUA_VERSION_NUM < 505
 		extern void luaL_openlibs(lua_State *);
 		luaL_openlibs(L);
-#else
-		// In Lua 5.5 and later has become a macro
-		extern void(
-		    luaL_openselectedlibs)(lua_State * L, int load, int preload);
-		luaL_openselectedlibs(L, ~0, 0);
-#endif
 	}
 #if defined(USE_LUA_SQLITE3)
 	{
@@ -2808,39 +2769,18 @@ lua_error_handler(lua_State *L)
 
 	lua_getglobal(L, "mg");
 	if (!lua_isnil(L, -1)) {
-		/* Write the error message to the error log */
-		lua_getfield(L, -1, "write");
+		lua_getfield(L, -1, "write"); /* call mg.write() */
 		lua_pushstring(L, error_msg);
 		lua_pushliteral(L, "\n");
-		lua_call(L, 2, 0); /* call mg.write(error_msg + \n) */
-		lua_pop(L, 1);     /* pop mg */
-
-		/* Get Lua traceback */
-		lua_getglobal(L, "debug");
-		lua_getfield(L, -1, "traceback");
-		lua_call(L, 0, 1); /* call debug.traceback() */
-		lua_remove(L, -2); /* remove debug */
-
-		/* Write the Lua traceback to the error log */
-		lua_getglobal(L, "mg");
-		lua_getfield(L, -1, "write");
-		lua_pushvalue(L, -3); /* push the traceback */
-
-		/* Only print the traceback if it is not empty */
-		if (strcmp(lua_tostring(L, -1), "stack traceback:") != 0) {
-			lua_pushliteral(L, "\n"); /* append a newline */
-			lua_call(L, 2, 0);        /* call mg.write(traceback + \n) */
-			lua_pop(L, 2);            /* pop mg and traceback */
-		} else {
-			lua_pop(L, 3); /* pop mg, traceback and error message */
-		}
-
+		lua_call(L, 2, 0);
+		IGNORE_UNUSED_RESULT(
+		    luaL_dostring(L, "mg.write(debug.traceback(), '\\n')"));
 	} else {
 		printf("Lua error: [%s]\n", error_msg);
 		IGNORE_UNUSED_RESULT(
 		    luaL_dostring(L, "print(debug.traceback(), '\\n')"));
 	}
-	lua_pop(L, 1); /* pop error message */
+	/* TODO(lsm, low): leave the stack balanced */
 
 	return 0;
 }
@@ -2889,13 +2829,11 @@ prepare_lua_environment(struct mg_context *ctx,
 #endif
 
 	/* Store context in the registry */
-#if defined(USE_WEBSOCKET)
 	if (ctx != NULL) {
 		lua_pushlightuserdata(L, (void *)&lua_regkey_ctx);
 		lua_pushlightuserdata(L, (void *)ctx);
 		lua_settable(L, LUA_REGISTRYINDEX);
 	}
-#endif /* USE_WEBSOCKET */
 	if (ws_conn_list != NULL) {
 		lua_pushlightuserdata(L, (void *)&lua_regkey_connlist);
 		lua_pushlightuserdata(L, (void *)ws_conn_list);
@@ -2967,8 +2905,8 @@ prepare_lua_environment(struct mg_context *ctx,
 	    || (lua_env_type == LUA_ENV_TYPE_BACKGROUND)) {
 		reg_function(L, "set_timeout", lwebsocket_set_timeout);
 		reg_function(L, "set_interval", lwebsocket_set_interval);
-	}
 #endif
+	}
 
 	reg_conn_function(L, "get_mime_type", lsp_get_mime_type, conn);
 	reg_conn_function(L, "get_option", lsp_get_option, conn);
@@ -2997,11 +2935,6 @@ prepare_lua_environment(struct mg_context *ctx,
 
 	if ((conn != NULL) && (conn->dom_ctx != NULL)) {
 		reg_string(L, "document_root", conn->dom_ctx->config[DOCUMENT_ROOT]);
-		if (conn->dom_ctx->config[FALLBACK_DOCUMENT_ROOT]) {
-			reg_string(L,
-			           "fallback_document_root",
-			           conn->dom_ctx->config[FALLBACK_DOCUMENT_ROOT]);
-		}
 		reg_string(L,
 		           "auth_domain",
 		           conn->dom_ctx->config[AUTHENTICATION_DOMAIN]);
@@ -3010,11 +2943,6 @@ prepare_lua_environment(struct mg_context *ctx,
 			reg_string(L,
 			           "websocket_root",
 			           conn->dom_ctx->config[WEBSOCKET_ROOT]);
-			if (conn->dom_ctx->config[FALLBACK_WEBSOCKET_ROOT]) {
-				reg_string(L,
-				           "fallback_websocket_root",
-				           conn->dom_ctx->config[FALLBACK_WEBSOCKET_ROOT]);
-			}
 		} else {
 			reg_string(L,
 			           "websocket_root",
@@ -3103,7 +3031,7 @@ mg_exec_lua_script(struct mg_connection *conn,
 
 	/* Execute a plain Lua script. */
 	if (path != NULL
-	    && (L = mg_lua_newstate(lua_allocator, (void *)(conn->phys_ctx)))
+	    && (L = lua_newstate(lua_allocator, (void *)(conn->phys_ctx)))
 	           != NULL) {
 		prepare_lua_environment(
 		    conn->phys_ctx, conn, NULL, L, path, LUA_ENV_TYPE_PLAIN_LUA_PAGE);
@@ -3130,14 +3058,9 @@ mg_exec_lua_script(struct mg_connection *conn,
 		}
 
 		if (luaL_loadfile(L, path) != 0) {
-			mg_send_http_error(conn, 500, "Lua error:\r\n");
 			lua_error_handler(L);
 		} else {
-			int call_status = lua_pcall(L, 0, 0, 0);
-			if (call_status != 0) {
-				mg_send_http_error(conn, 500, "Lua error:\r\n");
-				lua_error_handler(L);
-			}
+			lua_pcall(L, 0, 0, -2);
 		}
 		DEBUG_TRACE("Close Lua environment %p", L);
 		lua_close(L);
@@ -3219,7 +3142,7 @@ handle_lsp_request(struct mg_connection *conn,
 		L = ls;
 	} else {
 		/* We need to create a Lua state. */
-		L = mg_lua_newstate(lua_allocator, (void *)(conn->phys_ctx));
+		L = lua_newstate(lua_allocator, (void *)(conn->phys_ctx));
 		if (L == NULL) {
 			/* We neither got a Lua state from the command line,
 			 * nor did we succeed in creating our own state.
@@ -3365,7 +3288,7 @@ lua_websocket_new(const char *script, struct mg_connection *conn)
 		}
 		pthread_mutex_init(&(ws->ws_mutex), &pthread_mutex_attr);
 		(void)pthread_mutex_lock(&(ws->ws_mutex));
-		ws->state = mg_lua_newstate(lua_allocator, (void *)(conn->phys_ctx));
+		ws->state = lua_newstate(lua_allocator, (void *)(conn->phys_ctx));
 		ws->conn[0] = conn;
 		ws->references = 1;
 		prepare_lua_environment(conn->phys_ctx,
@@ -3741,7 +3664,7 @@ lua_init_optional_libraries(void)
 	lua_shared_init();
 
 /* UUID library */
-#if !defined(_WIN32) && !defined(NO_DLOPEN)
+#if !defined(_WIN32)
 	lib_handle_uuid = dlopen("libuuid.so", RTLD_LAZY);
 	pf_uuid_generate.p =
 	    (lib_handle_uuid ? dlsym(lib_handle_uuid, "uuid_generate") : 0);
@@ -3755,7 +3678,7 @@ static void
 lua_exit_optional_libraries(void)
 {
 /* UUID library */
-#if !defined(_WIN32) && !defined(NO_DLOPEN)
+#if !defined(_WIN32)
 	if (lib_handle_uuid) {
 		dlclose(lib_handle_uuid);
 	}
