@@ -43,7 +43,7 @@ let ws, sentAt=0, inFlight=false, pending=null, ema=0, groups=[];
 function connect(){
   const proto=location.protocol==='https:'?'wss':'ws';
   ws=new WebSocket(`${proto}://${location.host}/ws`); ws.binaryType='blob';
-  ws.onopen=()=>{ hud.className=''; hud.textContent='hold to edit · or tap a control'; };
+  ws.onopen=()=>{ hud.className=''; hud.textContent='press & hold image to edit · or tap a control below'; };
   ws.onclose=()=>{ hud.className='bad'; hud.textContent='reconnecting…'; setTimeout(connect,1000); };
   ws.onerror=()=>ws.close();
   ws.onmessage=async e=>{
@@ -168,7 +168,7 @@ function drawOverlay(){
     octx.fillStyle='#6cf'; octx.beginPath(); octx.arc(m+w*frac,y,12,0,7); octx.fill();
     octx.fillStyle='#fff'; octx.textAlign='center'; octx.font='600 20px system-ui'; octx.shadowColor='#000'; octx.shadowBlur=4;
     octx.fillText(`${it.label}   ${it.cur.toFixed(3)}`, innerWidth/2, y-28);
-    octx.font='13px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag anywhere · release to apply', innerWidth/2, y+34);
+    octx.font='13px system-ui'; octx.fillStyle='#cde'; octx.fillText('drag = adjust · tap = accept & close', innerWidth/2, y+34);
     octx.shadowBlur=0; return;
   }
   const items=ringItems(), n=items.length, r=R(), seg=2*Math.PI/n;
@@ -203,56 +203,66 @@ function updatePinch(){ const v=[...pointers.values()],a=v[0],b=v[1]; if(!a||!b|
   drawView();
 }
 
+// ---- gesture model: tap = accept&close · drag = adjust · long-press = open radial ----
+const HOLD_MS=260, MOVE_TH=10;
+let holdTimer=null, pressArmed=false, downX=0, downY=0, moved=false, justOpened=false;
+function clampRing(x,y){ const m=R()*1.06+18, bar=64;   // keep the whole ring on-screen
+  return { x:Math.max(m, Math.min(innerWidth-m, x)), y:Math.max(m, Math.min(innerHeight-bar-m, y)) }; }
+function openRadial(x,y){ const c=clampRing(x,y); cx=c.x; cy=c.y; state=ST.GROUPS; curGroup=-1; hover=-1;
+  justOpened=true; if(navigator.vibrate) navigator.vibrate(8); hud.textContent='drag to a module'; drawOverlay(); }
+function cancelHold(){ pressArmed=false; clearTimeout(holdTimer); holdTimer=null; }
+
 ovr.addEventListener('pointerdown', e=>{
   ovr.setPointerCapture(e.pointerId); pointers.set(e.pointerId, pos(e));
-  if(pointers.size>=2){ blockRadial=true; if(state!==ST.IDLE){ state=ST.IDLE; markActive(-1); drawOverlay(); } startPinch(); return; }
+  if(pointers.size>=2){ blockRadial=true; cancelHold(); state=ST.IDLE; whDrag=null; scrubbing=false; markActive(-1); drawOverlay(); startPinch(); return; }
   if(blockRadial) return;
-  const p=pos(e);
+  const p=pos(e); downX=p.x; downY=p.y; moved=false;
   if(state===ST.WHEEL){
     const my=WCY()+WR()+26, mw=WR()*1.6, mx=WCX()-mw/2;
-    const inMaster=(p.x>=mx-14 && p.x<=mx+mw+14 && Math.abs(p.y-my)<28);
-    whDrag = inMaster ? 'master' : 'chroma';   // chroma drags from ANYWHERE; master = bottom strip
-    whLX=p.x; whLY=p.y; whMoved=false;
-    return;
+    whDrag=(p.x>=mx-14 && p.x<=mx+mw+14 && Math.abs(p.y-my)<28)?'master':'chroma'; whLX=p.x; whLY=p.y;
   }
-  if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; return; }
-  cx=p.x; cy=p.y; if(state===ST.IDLE) state=ST.GROUPS; hover=pick(p.x,p.y); drawOverlay();
+  else if(state===ST.VALUE){ valStartX=p.x; valBase=valItem.cur; scrubbing=true; }
+  else if(state===ST.GROUPS||state===ST.PARAMS){ hover=pick(p.x,p.y); drawOverlay(); }
+  else { pressArmed=true; clearTimeout(holdTimer);   // IDLE: arm long-press to open radial
+    holdTimer=setTimeout(()=>{ if(pressArmed && pointers.size===1) openRadial(downX,downY); }, HOLD_MS); }
 });
 ovr.addEventListener('pointermove', e=>{
   if(pointers.has(e.pointerId)) pointers.set(e.pointerId, pos(e));
   if(pointers.size>=2){ updatePinch(); return; }
-  if(blockRadial || state===ST.IDLE) return;
-  const p=pos(e);
-  if(state===ST.WHEEL){
-    if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y; whMoved=true;
-      if(whDrag==='chroma') wheelChroma(dx,dy); else wheelMaster(dx); drawOverlay(); }
-    return;
-  }
-  if(state===ST.VALUE){
-    if(scrubbing){ const range=valItem.max-valItem.min;
+  if(blockRadial) return;
+  const p=pos(e); if(Math.hypot(p.x-downX,p.y-downY)>MOVE_TH) moved=true;
+  if(state===ST.IDLE){ if(pressArmed && moved) cancelHold(); return; }  // moved before hold = swipe, no radial
+  if(state===ST.WHEEL){ if(whDrag){ const dx=p.x-whLX, dy=p.y-whLY; whLX=p.x; whLY=p.y;
+      if(whDrag==='chroma') wheelChroma(dx,dy); else wheelMaster(dx); drawOverlay(); } return; }
+  if(state===ST.VALUE){ if(scrubbing){ const range=valItem.max-valItem.min;
       let val=valBase+((p.x-valStartX)/(innerWidth*0.8))*range;
-      val=Math.max(valItem.min,Math.min(valItem.max,val)); sendParam(valGI,valPI,val); drawOverlay(); }
-    return;
-  }
-  hover=pick(p.x,p.y); drawOverlay();
+      val=Math.max(valItem.min,Math.min(valItem.max,val)); sendParam(valGI,valPI,val); drawOverlay(); } return; }
+  hover=pick(p.x,p.y); drawOverlay();   // GROUPS / PARAMS
 });
 function endPointer(e){
   pointers.delete(e.pointerId);
-  if(pointers.size>=2){ startPinch(); return; }       // still pinching with remaining fingers
-  if(pointers.size===1){ pinch=null; return; }         // one finger left after pinch — wait for full release
+  if(pointers.size>=2){ startPinch(); return; }
+  if(pointers.size===1){ pinch=null; return; }
   if(blockRadial){ blockRadial=false; pinch=null; return; }
-  const p=pos(e), sel=(state===ST.GROUPS||state===ST.PARAMS)?pick(p.x,p.y):-1;
-  if(state===ST.GROUPS){ if(sel>=0){ curGroup=sel; cx=p.x; cy=p.y; state=ST.PARAMS; hover=-1; } else state=ST.IDLE; }
-  else if(state===ST.PARAMS){ if(sel>=0) enterValue(curGroup,sel); else state=ST.IDLE; }
-  else if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI); state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }
-  else if(state===ST.WHEEL){
-    if(whMoved){ bumpUsage(whGI,whPI); whDrag=null; }                               // a stroke — stay in the wheel
-    else { whDrag=null; state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; } // a tap — close
-  }
-  drawOverlay();
+  const p=pos(e), tap=!moved;
+  if(state===ST.IDLE){ cancelHold(); return; }   // short tap in idle → nothing (radial opens on hold)
+  if(state===ST.GROUPS){ const sel=pick(p.x,p.y);
+    if(sel>=0){ curGroup=sel; const c=clampRing(p.x,p.y); cx=c.x; cy=c.y; state=ST.PARAMS; hover=-1; hud.textContent='drag to a parameter'; }
+    else if(!justOpened) { state=ST.IDLE; hud.textContent='hold or tap'; }
+    justOpened=false; drawOverlay(); return; }
+  if(state===ST.PARAMS){ const sel=pick(p.x,p.y);
+    if(sel>=0) enterValue(curGroup,sel); else { state=ST.IDLE; hud.textContent='hold or tap'; }
+    drawOverlay(); return; }
+  if(state===ST.VALUE){ scrubbing=false; bumpUsage(valGI,valPI);
+    if(tap){ state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }   // tap = accept & close
+    drawOverlay(); return; }                                                   // drag = keep tool open
+  if(state===ST.WHEEL){
+    if(tap){ whDrag=null; state=ST.IDLE; markActive(-1); hud.textContent='hold or tap'; }  // tap = accept & close
+    else { bumpUsage(whGI,whPI); whDrag=null; }                                            // drag = keep wheel open
+    drawOverlay(); return; }
 }
 ovr.addEventListener('pointerup', endPointer);
-ovr.addEventListener('pointercancel', endPointer);
+ovr.addEventListener('pointercancel', e=>{ cancelHold(); endPointer(e); });
 
 addEventListener('resize', ()=>{ drawView(); if(state!==ST.IDLE) drawOverlay(); });
 connect();
