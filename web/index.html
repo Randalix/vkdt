@@ -11,7 +11,10 @@
               -webkit-tap-highlight-color:transparent; }
   #img, #menu { position:fixed; inset:0; width:100%; height:100%; }
   #img  { object-fit:contain; background:#000; }
-  #menu { touch-action:none; z-index:1; }
+  /* idle: pan-x pan-y lets the browser keep the edge-swipe-back gesture (and disables
+     browser pinch-zoom so our 2-finger zoom stays ours). JS sets 'none' while a tool
+     is active so drags control the tool instead of navigating back. */
+  #menu { touch-action:pan-x pan-y; z-index:1; }
   #hud  { position:fixed; left:0; right:0; top:0; z-index:3; padding:6px 10px; pointer-events:none;
           font-variant-numeric:tabular-nums; color:#9fb; text-align:center; text-shadow:0 1px 3px #000; }
   #hud.bad { color:#e88; }
@@ -166,7 +169,10 @@ function pick(x,y){ const dx=x-cx,dy=y-cy,n=ringItems().length;
   if(!n||dx*dx+dy*dy<R0()*R0()) return -1;
   return Math.min(n-1, Math.floor((Math.atan2(dy,dx)+Math.PI)/(2*Math.PI/n))); }
 
+// override the browser's edge-swipe-back ONLY while a tool/menu/pinch is active
+function applyTouchAction(){ ovr.style.touchAction = (state!==ST.IDLE || blockRadial || pointers.size>=2) ? 'none' : 'pan-x pan-y'; }
 function drawOverlay(){
+  applyTouchAction();
   fitCanvas(ovr); const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
   octx.clearRect(0,0,innerWidth,innerHeight);
   if(state===ST.IDLE) return;
@@ -286,9 +292,9 @@ ovr.addEventListener('pointermove', e=>{
 });
 function endPointer(e){
   pointers.delete(e.pointerId);
-  if(pointers.size>=2){ startPinch(); return; }
-  if(pointers.size===1){ pinch=null; return; }
-  if(blockRadial){ blockRadial=false; pinch=null; return; }
+  if(pointers.size>=2){ startPinch(); applyTouchAction(); return; }
+  if(pointers.size===1){ pinch=null; applyTouchAction(); return; }
+  if(blockRadial){ blockRadial=false; pinch=null; applyTouchAction(); return; }
   const p=pos(e), tap=!moved;
   if(state===ST.IDLE){ cancelHold(); return; }   // short tap in idle → nothing (radial opens on hold)
   if(state===ST.CROP){
