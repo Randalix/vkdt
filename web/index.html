@@ -18,14 +18,16 @@
   /* bottom strip: recently used sliders. subtle backdrop only behind the strip itself. */
   #recents { position:fixed; left:0; right:0; bottom:0; z-index:2;
              padding:10px 12px calc(10px + env(safe-area-inset-bottom));
-             display:flex; flex-direction:column; gap:7px;
-             background:linear-gradient(transparent, rgba(8,8,10,.78) 38%); }
-  #recents:empty { display:none; }
+             display:flex; flex-direction:column; gap:8px;
+             background:linear-gradient(transparent, rgba(6,7,9,.92) 30%); }
+  #recents .head { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#778;
+                   text-shadow:0 1px 2px #000; }
+  .hint { color:#7a8; font-size:12px; padding:2px 0 4px; text-shadow:0 1px 2px #000; }
   .row { display:flex; align-items:center; gap:10px; }
-  .row .lbl { width:84px; font-size:12px; color:#cdd; white-space:nowrap; overflow:hidden;
+  .row .lbl { width:90px; font-size:13px; color:#e6eaee; white-space:nowrap; overflow:hidden;
               text-overflow:ellipsis; text-shadow:0 1px 2px #000; }
-  .row input { flex:1; height:30px; touch-action:none; }
-  .row .val { width:58px; text-align:right; font-size:12px; color:#9ab; font-variant-numeric:tabular-nums;
+  .row input { flex:1; height:34px; touch-action:none; accent-color:#6cf; }
+  .row .val { width:60px; text-align:right; font-size:13px; color:#bcd; font-variant-numeric:tabular-nums;
               text-shadow:0 1px 2px #000; }
 </style>
 </head>
@@ -96,6 +98,12 @@ function syncRecent(gi, pi){ // update the slider widget if this param is in the
 }
 function renderRecents(){
   recEl.innerHTML='';
+  const head=document.createElement('div'); head.className='head'; head.textContent='recent'; recEl.append(head);
+  if(!recents.length){
+    const h=document.createElement('div'); h.className='hint';
+    h.textContent='hold on the image to pick a control — used sliders collect here';
+    recEl.append(h); return;
+  }
   for(const r of recents){
     const it = groups[r.gi].items[r.pi];
     const row=document.createElement('div'); row.className='row';
@@ -194,6 +202,7 @@ ovr.addEventListener('pointerup', e=>{
 });
 
 addEventListener('resize', ()=>{ if(state!==ST.IDLE) drawOverlay(); });
+renderRecents();   // show the (empty) recent strip with its hint on load
 connect();
 </script>
 </body>
