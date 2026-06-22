@@ -264,7 +264,15 @@ function openRadial(x,y){ const c=clampRing(x,y); cx=c.x; cy=c.y; state=ST.GROUP
   justOpened=true; if(navigator.vibrate) navigator.vibrate(8); hud.textContent='drag to a module'; drawOverlay(); }
 function cancelHold(){ pressArmed=false; clearTimeout(holdTimer); holdTimer=null; }
 
+// immersive: go fullscreen on first touch (and recover if the user leaves it).
+// in fullscreen Android gates the system edge-back gesture, so tool drags from the
+// edge are not stolen by the OS back navigation. needs a user gesture -> pointerdown.
+function tryFullscreen(){ if(document.fullscreenElement) return;
+  const el=document.documentElement, fn=el.requestFullscreen||el.webkitRequestFullscreen;
+  if(fn){ try{ const r=fn.call(el); if(r&&r.catch) r.catch(()=>{}); }catch(_){} } }
+
 ovr.addEventListener('pointerdown', e=>{
+  tryFullscreen();
   ovr.setPointerCapture(e.pointerId); pointers.set(e.pointerId, pos(e));
   if(pointers.size>=2){ blockRadial=true; cancelHold(); state=ST.IDLE; whDrag=null; scrubbing=false; markActive(-1); drawOverlay(); startPinch(); return; }
   if(blockRadial) return;
