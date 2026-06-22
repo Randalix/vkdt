@@ -478,7 +478,7 @@ static int open_image(const char *image)
   const int raw = image && is_raw_path(image);
   const char *cfg = raw ? g_conf.cfg_raw : g_conf.cfg;
   const char *inmod = raw ? "i-raw" : "i-jpg";
-  char proxypath[1024] = ""; const char *use_image = image;
+  char proxypath[1024] = "", abspath[1024]; const char *use_image = image;
   if(image && !raw)
   {
     snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
@@ -486,7 +486,12 @@ static int open_image(const char *image)
     { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
     else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
   }
-  else if(raw) lg("srv", "raw input <- %s", image);
+  else if(raw)
+  { // i-raw needs a resolvable path: pass it absolute (modify_roi_out early-returns on an
+    // unresolvable filename -> the o-jpg sink gets an uninited size and export fails).
+    if(realpath(image, abspath)) use_image = abspath;
+    lg("srv", "raw input <- %s", use_image);
+  }
 
   static int built = 0;
   if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
