@@ -170,7 +170,10 @@ function pick(x,y){ const dx=x-cx,dy=y-cy,n=ringItems().length;
   return Math.min(n-1, Math.floor((Math.atan2(dy,dx)+Math.PI)/(2*Math.PI/n))); }
 
 // override the browser's edge-swipe-back ONLY while a tool/menu/pinch is active
-function applyTouchAction(){ ovr.style.touchAction = (state!==ST.IDLE || blockRadial || pointers.size>=2) ? 'none' : 'pan-x pan-y'; }
+function applyTouchAction(){ const cap = (state!==ST.IDLE || blockRadial || pointers.size>=2);
+  ovr.style.touchAction = cap ? 'none' : 'pan-x pan-y';
+  // also block Chrome's own overscroll history-nav while a tool is active (idle keeps it)
+  document.documentElement.style.overscrollBehaviorX = cap ? 'none' : ''; }
 function drawOverlay(){
   applyTouchAction();
   fitCanvas(ovr); const d=devicePixelRatio||1; octx.setTransform(d,0,0,d,0,0);
