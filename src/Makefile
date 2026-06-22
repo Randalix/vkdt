@@ -103,6 +103,9 @@ db/%.o: db/%.c Makefile $(DB_H) db/flat.mk
 cli/%.o: cli/%.c Makefile $(CLI_H) cli/flat.mk
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(VK_CFLAGS) $(CLI_CFLAGS) -c $< -o $@
 
+server/civetweb/%.o: server/civetweb/%.c server/flat.mk
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(SERVER_CIV_CFLAGS) -c $< -o $@
+
 server/%.o: server/%.c Makefile $(SERVER_H) server/flat.mk
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(OPT_CFLAGS) $(VK_CFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
@@ -126,9 +129,14 @@ gui/%.o: gui/%.c Makefile $(GUI_H) gui/flat.mk
 
 # web remote server (rabbit_editor)
 # ======================
-../bin/vkdt-server: $(SERVER_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) Makefile
-	$(CC) $(SERVER_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) -pie -o $@ \
+../bin/vkdt-server: $(SERVER_O) $(SERVER_CIV_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) Makefile
+	$(CC) $(SERVER_O) $(SERVER_CIV_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) -pie -o $@ \
     $(LDFLAGS) $(SERVER_LDFLAGS) $(QVK_LDFLAGS) $(PIPE_LDFLAGS) $(CORE_LDFLAGS) $(DB_LDFLAGS) $(OPT_LDFLAGS)
+
+# M1 resident render-core probe (benchmark)
+../bin/vkdt-m1: $(SERVER_M1_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) Makefile
+	$(CC) $(SERVER_M1_O) $(QVK_O) $(CORE_O) $(PIPE_O) $(DB_O) -pie -o $@ \
+    $(LDFLAGS) $(DYNAMIC) -lm $(QVK_LDFLAGS) $(PIPE_LDFLAGS) $(CORE_LDFLAGS) $(DB_LDFLAGS) $(OPT_LDFLAGS)
 
 # parameter optimiser
 # ======================

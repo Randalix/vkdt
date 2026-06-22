@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rabbit_editor — M2</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0d0d0f; color:#cfd2d6;
+              font:14px/1.4 system-ui, sans-serif; -webkit-user-select:none; user-select:none; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  #view { flex:1; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  canvas { max-width:100%; max-height:100%; image-rendering:auto; }
+  #panel { padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:#15151a; }
+  #panel label { display:flex; align-items:center; gap:10px; }
+  input[type=range] { flex:1; height:34px; touch-action:none; }
+  #stat { margin-top:8px; font-variant-numeric:tabular-nums; color:#8b9; min-height:1.4em; }
+  #stat.bad { color:#d77; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="view"><canvas id="c"></canvas></div>
+  <div id="panel">
+    <label>edges <input id="s" type="range" min="0" max="1" step="0.005" value="0.5"></label>
+    <div id="stat">connecting…</div>
+  </div>
+</div>
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d', { alpha:false });
+const s = document.getElementById('s'), stat = document.getElementById('stat');
+let ws, sentAt = 0, inFlight = false, queued = null, frames = 0, ema = 0;
+
+function draw(blob){
+  return createImageBitmap(blob).then(bmp => {
+    if(c.width !== bmp.width || c.height !== bmp.height){ c.width = bmp.width; c.height = bmp.height; }
+    ctx.drawImage(bmp, 0, 0); bmp.close();
+  });
+}
+
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'blob';
+  ws.onopen  = () => { stat.className=''; stat.textContent = 'connected'; };
+  ws.onclose = () => { stat.className='bad'; stat.textContent = 'disconnected — retrying…'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = async (e) => {
+    const rtt = performance.now() - sentAt;
+    await draw(e.data);
+    ema = ema ? ema*0.8 + rtt*0.2 : rtt;
+    stat.textContent = `round-trip ${rtt.toFixed(0)} ms (avg ${ema.toFixed(0)}) · ${(e.data.size/1024).toFixed(0)} KB · ${++frames} frames`;
+    inFlight = false;
+    if(queued !== null){ const q = queued; queued = null; send(q); }
+  };
+}
+
+// throttle: at most one render in flight; keep only the latest pending value.
+function send(v){
+  if(!ws || ws.readyState !== 1) return;
+  if(inFlight){ queued = v; return; }
+  inFlight = true; sentAt = performance.now();
+  ws.send('edges=' + v);
+}
+
+s.addEventListener('input', () => send(s.value));
+connect();
+</script>
+</body>
+</html>
