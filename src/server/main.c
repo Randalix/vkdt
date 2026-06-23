@@ -45,6 +45,7 @@ static char            g_jpgpath[512];
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
+static char            g_cur_image[1024];      // current ORIGINAL image (not the proxy) — for full-res export
 static volatile int    g_dirty = 0;           // edits pending an autosave
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
 static FILE           *g_logf = NULL;         // optional logfile (config: logfile=)
@@ -492,6 +493,8 @@ static int open_image(const char *image)
     if(realpath(image, abspath)) use_image = abspath;
     lg("srv", "raw input <- %s", use_image);
   }
+  // remember the ORIGINAL (absolute) image for full-res export
+  if(image) { char a[1024]; snprintf(g_cur_image, sizeof(g_cur_image), "%s", realpath(image, a) ? a : image); }
 
   static int built = 0;
   if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
@@ -594,6 +597,84 @@ static int upload_handler(struct mg_connection *c, void *u)
   return 200;
 }
 
+// HTTP GET /export?q=92&max=0 : render the current edit at full resolution from the
+// ORIGINAL image (no preview proxy) in a fresh graph, return as a JPEG download.
+// q = jpeg quality, max = longest edge (0 = native). (WebP/EXR: future.)
+static int export_handler(struct mg_connection *c, void *u)
+{
+  (void)u;
+  const struct mg_request_info *ri = mg_get_request_info(c);
+  char qs[8] = "92", ms[8] = "0";
+  if(ri->query_string)
+  {
+    mg_get_var(ri->query_string, strlen(ri->query_string), "q",   qs, sizeof(qs));
+    mg_get_var(ri->query_string, strlen(ri->query_string), "max", ms, sizeof(ms));
+  }
+  int quality = atoi(qs); if(quality < 1 || quality > 100) quality = 92;
+  int maxdim = atoi(ms);  if(maxdim < 0) maxdim = 0;
+  if(!g_cur_image[0]) { mg_printf(c, "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n"); return 409; }
+  if(g_dirty) recipe_save();
+
+  pthread_mutex_lock(&g_lock);
+  const int raw = is_raw_path(g_cur_image);
+  dt_graph_t ex; dt_graph_init(&ex, s_queue_compute);
+  snprintf(ex.searchpath, sizeof(ex.searchpath), ".");
+  dt_graph_export_t p = {0};
+  p.p_cfgfile  = raw ? g_conf.cfg_raw : g_conf.cfg;
+  p.output_cnt = 1;
+  p.output[0].inst             = dt_token("main");
+  p.output[0].mod              = dt_token("o-jpg");
+  p.output[0].p_filename       = "rabbit_export";
+  p.output[0].quality          = quality;
+  p.output[0].colour_primaries = s_colour_primaries_srgb;
+  p.output[0].colour_trc       = s_colour_trc_srgb;
+  p.output[0].max_width        = maxdim;   // 0 = native
+  p.output[0].max_height       = maxdim;
+  char imgline[1280];
+  snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", raw ? "i-raw" : "i-jpg", g_cur_image);
+  char *extra[1] = { imgline }; p.extra_param_cnt = 1; p.p_extra_param = extra;
+
+  int ok = 0;
+  if(dt_graph_export(&ex, &p) == VK_SUCCESS)
+  { // overlay the current recipe (skip input + output module params), then re-render
+    if(g_recipe_path[0])
+    {
+      FILE *rf = fopen(g_recipe_path, "r");
+      if(rf)
+      {
+        char line[4096];
+        while(fgets(line, sizeof(line), rf))
+        {
+          line[strcspn(line, "\r\n")] = 0;
+          if(strncmp(line, "param:", 6)) continue;
+          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12) || !strncmp(line, "param:o-", 8)) continue;
+          dt_graph_read_config_line(&ex, line);
+        }
+        fclose(rf);
+      }
+    }
+    ex.runflags = s_graph_run_all | s_graph_run_download_sink | s_graph_run_wait_done | s_graph_run_record_cmd_buf;
+    if(dt_graph_run(&ex, ex.runflags) == VK_SUCCESS) ok = 1;
+  }
+  dt_graph_cleanup(&ex);
+  pthread_mutex_unlock(&g_lock);
+
+  unsigned char *buf = 0; long n = 0;
+  if(ok)
+  {
+    FILE *f = fopen("rabbit_export.jpg", "rb");
+    if(f) { fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            if(n > 0) { buf = malloc(n); if(fread(buf, 1, n, f) != (size_t)n) { free(buf); buf = 0; } } fclose(f); }
+  }
+  if(!buf) { lg("err", "export failed"); mg_printf(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); return 500; }
+  const char *base = strrchr(g_cur_image, '/'); base = base ? base + 1 : g_cur_image;
+  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n"
+               "Content-Disposition: attachment; filename=\"rabbit_%s.jpg\"\r\nContent-Length: %ld\r\n\r\n", base, n);
+  mg_write(c, (const char *)buf, n); free(buf);
+  lg("srv", "export %s.jpg %ld B (q%d max%d)", base, n, quality, maxdim);
+  return 200;
+}
+
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
 int main(int argc, char *argv[])
@@ -638,6 +719,7 @@ int main(int argc, char *argv[])
   if(!ctx) { lg("err", "mg_start failed (port %s)", g_conf.port); return 1; }
   mg_set_websocket_handler(ctx, "/ws", ws_connect, ws_ready, ws_data, ws_close, NULL);
   mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
+  mg_set_request_handler(ctx, "/export", export_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
