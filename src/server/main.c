@@ -628,8 +628,8 @@ static int export_handler(struct mg_connection *c, void *u)
   p.output[0].quality          = quality;
   p.output[0].colour_primaries = s_colour_primaries_srgb;
   p.output[0].colour_trc       = s_colour_trc_srgb;
-  p.output[0].max_width        = maxdim;   // 0 = native
-  p.output[0].max_height       = maxdim;
+  p.output[0].max_width        = 0;   // size is controlled by the resize module below
+  p.output[0].max_height       = 0;
   char imgline[1280];
   snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", raw ? "i-raw" : "i-jpg", g_cur_image);
   char *extra[1] = { imgline }; p.extra_param_cnt = 1; p.p_extra_param = extra;
@@ -653,6 +653,11 @@ static int export_handler(struct mg_connection *c, void *u)
         fclose(rf);
       }
     }
+    // override the preview resize cap so export is full-res: resize<=maxdim (0 = native).
+    // resize only ever downscales (scale=MIN(1,...)), so this never upscales.
+    char rz[64];
+    snprintf(rz, sizeof(rz), "param:resize:01:width:%d", maxdim);  dt_graph_read_config_line(&ex, rz);
+    snprintf(rz, sizeof(rz), "param:resize:01:height:%d", maxdim); dt_graph_read_config_line(&ex, rz);
     ex.runflags = s_graph_run_all | s_graph_run_download_sink | s_graph_run_wait_done | s_graph_run_record_cmd_buf;
     if(dt_graph_run(&ex, ex.runflags) == VK_SUCCESS) ok = 1;
   }
