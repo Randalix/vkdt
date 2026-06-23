@@ -424,7 +424,9 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     {
       pthread_mutex_lock(&g_lock);
       dt_module_t *m = g_graph.module + mi;
-      if(m->so->ui_callback)
+      // guard: only the crop module's ui_callback does the inscribed-crop fit. other modules
+      // also define ui_callback with unrelated (graph-mutating) effects (e.g. pick) — don't run those.
+      if(m->so && m->name == dt_token("crop") && m->so->ui_callback)
       {
         m->so->ui_callback(m, dt_token("crop"));   // writes the inscribed crop into the crop param
         const int cp = dt_module_get_param(m->so, dt_token("crop"));
@@ -437,12 +439,23 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   { char bn[48]; int on;   // bypass <name:inst> <0|1> : route a module out of / back into the graph (cfg rewrite + reload)
     if(sscanf(tmp, "bypass %47s %d", bn, &on) == 2)
     {
+      // never bypass input/output/display modules — routing those out has no valid splice
+      if(!strncmp(bn, "i-", 2) || !strncmp(bn, "o-", 2) || !strncmp(bn, "display", 7))
+      { lg("err", "refusing to bypass %s", bn); return 1; }
+      // snapshot for rollback if the rebuild fails (don't leave a stuck broken session)
+      char save[16][48]; int savecnt = g_bypass_cnt; memcpy(save, g_bypass, sizeof(save));
       int idx = -1; for(int i = 0; i < g_bypass_cnt; i++) if(!strcmp(g_bypass[i], bn)) idx = i;
       if(on && idx < 0 && g_bypass_cnt < 16) snprintf(g_bypass[g_bypass_cnt++], 48, "%s", bn);
       else if(!on && idx >= 0) { g_bypass[idx][0] = 0; for(int i = idx; i < g_bypass_cnt - 1; i++) memcpy(g_bypass[i], g_bypass[i+1], 48); g_bypass_cnt--; }
       pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
-      if(err) lg("err", "bypass rebuild failed for %s", bn);
-      else { lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt); after_graph_change(c); send_graph(c); g_dirty = 1; }   // topology changed -> push graph too
+      if(err)
+      { // revert the bypass set and rebuild the last good graph
+        lg("err", "bypass rebuild failed for %s — reverting", bn);
+        memcpy(g_bypass, save, sizeof(save)); g_bypass_cnt = savecnt;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      }
+      lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt);
+      after_graph_change(c); send_graph(c);
       return 1;
     }
   }
@@ -551,6 +564,53 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
 // (~400ms/12MP); editing the proxy keeps the loop fast. returns 0 on success.
 struct jpgerr_t { struct jpeg_error_mgr pub; jmp_buf jb; };
 static void jpg_err(j_common_ptr ci){ longjmp(((struct jpgerr_t*)ci->err)->jb, 1); }
+
+// read the EXIF Orientation tag (0x0112) from the saved APP1 marker. returns 1..8 (1=normal).
+// vkdt's i-jpg doesn't apply EXIF orientation, so we bake it into the preview proxy instead.
+static int exif_orientation(j_decompress_ptr di)
+{
+  for(jpeg_saved_marker_ptr m = di->marker_list; m; m = m->next)
+  {
+    if(m->marker != JPEG_APP0 + 1 || m->data_length < 14) continue;
+    const unsigned char *d = m->data; if(memcmp(d, "Exif\0\0", 6)) continue;
+    const unsigned char *t = d + 6; const unsigned len = m->data_length - 6;
+    const int le = t[0] == 'I';
+    #define E16(p) (le ? ((p)[0] | ((p)[1]<<8)) : (((p)[0]<<8) | (p)[1]))
+    #define E32(p) (le ? ((p)[0] | ((p)[1]<<8) | ((unsigned)(p)[2]<<16) | ((unsigned)(p)[3]<<24)) : (((unsigned)(p)[0]<<24) | ((p)[1]<<16) | ((p)[2]<<8) | (p)[3]))
+    unsigned ifd = E32(t + 4); if(ifd + 2 > len) continue;
+    const int n = E16(t + ifd);
+    for(int i = 0; i < n; i++)
+    {
+      const unsigned char *e = t + ifd + 2 + (unsigned)i * 12;
+      if(e + 12 > d + m->data_length) break;
+      if(E16(e) == 0x0112) { const int v = E16(e + 8); return (v >= 1 && v <= 8) ? v : 1; }
+    }
+    #undef E16
+    #undef E32
+  }
+  return 1;
+}
+
+// rotate an interleaved w*h*c buffer to upright per the EXIF orientation (handles the
+// 90/180/270 rotations 3/6/8; mirrored orientations are rare from cameras and left as-is).
+// updates *pw/*ph; returns the new buffer (frees the old) or the original on no-op/oom.
+static unsigned char *apply_orientation(unsigned char *buf, int *pw, int *ph, int c, int orient)
+{
+  if(orient != 3 && orient != 6 && orient != 8) return buf;
+  const int w = *pw, h = *ph;
+  const int nw = (orient == 3) ? w : h, nh = (orient == 3) ? h : w;
+  unsigned char *o = malloc((size_t)nw * nh * c); if(!o) return buf;
+  for(int dy = 0; dy < nh; dy++) for(int dx = 0; dx < nw; dx++)
+  {
+    int sx, sy;
+    if(orient == 3)      { sx = w - 1 - dx; sy = h - 1 - dy; }   // 180
+    else if(orient == 6) { sx = dy;         sy = h - 1 - dx; }   // 90 CW
+    else                 { sx = w - 1 - dy; sy = dx;         }   // 90 CCW (8)
+    memcpy(o + ((size_t)dy * nw + dx) * c, buf + ((size_t)sy * w + sx) * c, c);
+  }
+  free(buf); *pw = nw; *ph = nh; return o;
+}
+
 static int make_proxy(const char *in, const char *out, int maxdim)
 {
   FILE *fi = fopen(in, "rb"); if(!fi) return 1;
@@ -558,15 +618,19 @@ static int make_proxy(const char *in, const char *out, int maxdim)
   di.err = jpeg_std_error(&de.pub); de.pub.error_exit = jpg_err;
   unsigned char *buf = 0; FILE *fo = 0;
   if(setjmp(de.jb)) { jpeg_destroy_decompress(&di); if(fi)fclose(fi); if(fo)fclose(fo); free(buf); return 1; }
-  jpeg_create_decompress(&di); jpeg_stdio_src(&di, fi); jpeg_read_header(&di, TRUE);
+  jpeg_create_decompress(&di); jpeg_stdio_src(&di, fi);
+  jpeg_save_markers(&di, JPEG_APP0 + 1, 0xFFFF);   // keep the EXIF marker so we can read orientation
+  jpeg_read_header(&di, TRUE);
+  const int orient = exif_orientation(&di);
   int full = di.image_width > di.image_height ? di.image_width : di.image_height;
   di.scale_num = 1; di.scale_denom = 1;            // libjpeg supports 1/2,1/4,1/8
   while(di.scale_denom < 8 && full/(di.scale_denom*2) >= maxdim) di.scale_denom *= 2;
   jpeg_start_decompress(&di);
-  const int w = di.output_width, h = di.output_height, c = di.output_components;
+  int w = di.output_width, h = di.output_height; const int c = di.output_components;
   buf = malloc((size_t)w*h*c);
   while(di.output_scanline < di.output_height){ unsigned char *row = buf + (size_t)di.output_scanline*w*c; jpeg_read_scanlines(&di, &row, 1); }
   jpeg_finish_decompress(&di); jpeg_destroy_decompress(&di); fclose(fi); fi = 0;
+  buf = apply_orientation(buf, &w, &h, c, orient);   // bake EXIF orientation into the proxy (vkdt i-jpg ignores it)
 
   fo = fopen(out, "wb"); if(!fo){ free(buf); return 1; }
   struct jpeg_compress_struct co; struct jpgerr_t ce;
@@ -661,9 +725,9 @@ static const char *effective_cfg(const char *base)
         if(!referenced && !keep) continue;              // prune orphan
       }
     }
-    o += snprintf(o, e - o, "%s\n", line[i]);
+    if(o < e) o += snprintf(o, e - o, "%s\n", line[i]);   // defensive: never snprintf with a wrapped size
   }
-  for(int i = 0; i < ncn; i++) o += snprintf(o, e - o, "%s\n", nc[i]);
+  for(int i = 0; i < ncn && o < e; i++) o += snprintf(o, e - o, "%s\n", nc[i]);
 
   const char *path = "rabbit_eff.cfg";
   FILE *w = fopen(path, "wb"); if(!w) return base;
@@ -773,6 +837,11 @@ static int open_image(const char *image)
 static void recipe_save(void)
 {
   if(!g_recipe_path[0]) return;
+  // never persist while a module is bypassed: the built graph is the routed-around one, so
+  // saving would drop the bypassed module + its params from the sidecar (un-bypass would
+  // restore them at defaults = edit loss). bypass is a runtime-only view; the recipe stays
+  // at the last full-graph state and un-bypass restores everything intact.
+  if(g_bypass_cnt > 0) return;
   pthread_mutex_lock(&g_lock);
   int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
   pthread_mutex_unlock(&g_lock);
