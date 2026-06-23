@@ -279,6 +279,41 @@ static void send_history(struct mg_connection *c)
   mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
 }
 
+// send the module DAG (topology) for the node-graph view: modules + input-connection links.
+static void send_graph(struct mg_connection *c)
+{
+  static char buf[32768];
+  char *o = buf, *e = buf + sizeof(buf);
+  pthread_mutex_lock(&g_lock);
+  o += snprintf(o, e-o, "{\"type\":\"graph\",\"modules\":[");
+  int first = 1;
+  for(int m = 0; m < g_graph.num_modules; m++)
+  {
+    if(!g_graph.module[m].so) continue;
+    if(!first) o += snprintf(o, e-o, ","); first = 0;
+    o += snprintf(o, e-o, "{\"id\":%d,\"name\":\"%"PRItkn"\",\"inst\":\"%"PRItkn"\"}",
+        m, dt_token_str(g_graph.module[m].name), dt_token_str(g_graph.module[m].inst));
+  }
+  o += snprintf(o, e-o, "],\"links\":[");
+  first = 1;
+  for(int m = 0; m < g_graph.num_modules; m++)
+  {
+    dt_module_t *mod = g_graph.module + m; if(!mod->so) continue;
+    for(int cc = 0; cc < mod->num_connectors; cc++)
+    {
+      dt_connector_t *cn = mod->connector + cc;
+      if(dt_connector_input(cn) && cn->connected.i >= 0)
+      {
+        if(!first) o += snprintf(o, e-o, ","); first = 0;
+        o += snprintf(o, e-o, "{\"from\":%d,\"fc\":%d,\"to\":%d,\"tc\":%d}", cn->connected.i, cn->connected.c, m, cc);
+      }
+    }
+  }
+  o += snprintf(o, e-o, "]}");
+  pthread_mutex_unlock(&g_lock);
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
+}
+
 // after a history op (undo/redo/jump/reset) the whole edit state changed: re-render,
 // re-send the dynamic menu (so the client's param values stay in sync) and the history.
 static void after_graph_change(struct mg_connection *c)
@@ -331,6 +366,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   }
 
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
+  if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
   if(!strncmp(tmp, "undo", 4))
   {
     pthread_mutex_lock(&g_lock);
