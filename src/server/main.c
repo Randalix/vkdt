@@ -419,6 +419,21 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   if(!strncmp(tmp, "scope", 5)) { push_hist_frame(c); return 1; }   // histogram widget: send current waveform
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
+  { int mi;   // fitcrop <modid> : auto-fit the crop to the rotated inscribed rect (vkdt's own geometry, item 32 v2)
+    if(sscanf(tmp, "fitcrop %d", &mi) == 1 && mi >= 0 && mi < g_graph.num_modules)
+    {
+      pthread_mutex_lock(&g_lock);
+      dt_module_t *m = g_graph.module + mi;
+      if(m->so->ui_callback)
+      {
+        m->so->ui_callback(m, dt_token("crop"));   // writes the inscribed crop into the crop param
+        const int cp = dt_module_get_param(m->so, dt_token("crop"));
+        if(cp >= 0) { g_graph.active_module = mi; dt_graph_history_append(&g_graph, mi, cp, 0.0); }
+      }
+      pthread_mutex_unlock(&g_lock);
+      after_graph_change(c); return 1;   // re-render + push menu (new crop cur) + history
+    }
+  }
   { char bn[48]; int on;   // bypass <name:inst> <0|1> : route a module out of / back into the graph (cfg rewrite + reload)
     if(sscanf(tmp, "bypass %47s %d", bn, &on) == 2)
     {
@@ -427,7 +442,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       else if(!on && idx >= 0) { g_bypass[idx][0] = 0; for(int i = idx; i < g_bypass_cnt - 1; i++) memcpy(g_bypass[i], g_bypass[i+1], 48); g_bypass_cnt--; }
       pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
       if(err) lg("err", "bypass rebuild failed for %s", bn);
-      else { lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt); after_graph_change(c); g_dirty = 1; }
+      else { lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt); after_graph_change(c); send_graph(c); g_dirty = 1; }   // topology changed -> push graph too
       return 1;
     }
   }
