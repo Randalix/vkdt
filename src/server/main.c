@@ -134,7 +134,11 @@ static inline int is_straight(const dt_ui_param_t *p)
 { // rotate angle (degrees), float[1] — vkdt "straight" widget
   return p->widget.type == dt_token("straight") && p->type == dt_token("float") && p->cnt == 1;
 }
-static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p) || is_crop(p) || is_straight(p); }
+static inline int is_combo(const dt_ui_param_t *p)
+{
+  return p->widget.type == dt_token("combo") && p->type == dt_token("int") && p->cnt == 1 && p->widget.data;
+}
+static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p) || is_crop(p) || is_straight(p) || is_combo(p); }
 
 static inline float param_get(int modid, int parid)
 {
@@ -271,6 +275,14 @@ static void build_menu_json(void)
         float cur = param_get(m, pi); if(cur == 1337.0f) cur = 0.0f;
         o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":-180,\"max\":180,\"def\":0,\"cur\":%g}",
             pi, cur);
+      }
+      else if(is_combo(p))
+      { // int param with a combo widget -> a toggle/cycle. options are \0-separated in widget.data
+        const int cur = *(const int *)((uint8_t *)g_graph.module[m].param + p->offset);
+        o += snprintf(o, e-o, "\",\"kind\":\"combo\",\"parid\":%d,\"cur\":%d,\"options\":[", pi, cur);
+        const char *opt = (const char *)p->widget.data; int firsto = 1;
+        while(*opt) { o += snprintf(o, e-o, "%s\"%s\"", firsto ? "" : ",", opt); firsto = 0; opt += strlen(opt) + 1; }
+        o += snprintf(o, e-o, "]}");
       }
       else o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
           pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
@@ -556,6 +568,29 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       fprintf(stderr, "[srv] setvec %d:%d  render %.1f ms  %zu B\n", modid, parid, ms, n);
     }
     g_dirty = 1;
+  }
+
+  // int set (combo toggles): "I <modid> <parid> <ival>"
+  { int im, ip, iv;
+    if(sscanf(tmp, "I %d %d %d", &im, &ip, &iv) == 3 && im >= 0 && im < g_graph.num_modules)
+    {
+      pthread_mutex_lock(&g_lock);
+      dt_module_t *m = g_graph.module + im;
+      const dt_ui_param_t *p = m->so->param[ip];
+      int *val = (int *)((uint8_t *)m->param + p->offset);
+      int old = *val; *val = iv;
+      dt_graph_run_t fl = s_graph_run_none;
+      if(m->so->check_params) fl = m->so->check_params(m, ip, 0, &old);
+      g_graph.active_module = im;
+      dt_graph_history_append(&g_graph, im, ip, 2.0);
+      size_t n = 0; double ms = 0;
+      unsigned char *b = render_to_jpeg(&n, &ms, fl);
+      pthread_mutex_unlock(&g_lock);
+      if(b) { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n); free(b);
+              fprintf(stderr, "[srv] setint %d:%d = %d  render %.1f ms  %zu B\n", im, ip, iv, ms, n); }
+      g_dirty = 1;
+      return 1;
+    }
   }
   return 1;
 }
