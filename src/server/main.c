@@ -44,6 +44,8 @@ static const char     *g_jpgbase = "preview";
 static char            g_jpgpath[512];
 static const char     *g_histbase = "histogram";  // second sink: the waveform histogram image
 static char            g_histpath[512];
+static char            g_bypass[16][48];           // bypassed modules ("name:inst") — routed around in the cfg
+static int             g_bypass_cnt = 0;
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
@@ -356,6 +358,8 @@ static void send_graph(struct mg_connection *c)
       }
     }
   }
+  o += snprintf(o, e-o, "],\"bypassed\":[");   // routed-out modules (not in the graph) so the client can re-enable them
+  for(int i = 0; i < g_bypass_cnt; i++) o += snprintf(o, e-o, "%s\"%s\"", i ? "," : "", g_bypass[i]);
   o += snprintf(o, e-o, "]}");
   pthread_mutex_unlock(&g_lock);
   mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
@@ -415,6 +419,18 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   if(!strncmp(tmp, "scope", 5)) { push_hist_frame(c); return 1; }   // histogram widget: send current waveform
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
+  { char bn[48]; int on;   // bypass <name:inst> <0|1> : route a module out of / back into the graph (cfg rewrite + reload)
+    if(sscanf(tmp, "bypass %47s %d", bn, &on) == 2)
+    {
+      int idx = -1; for(int i = 0; i < g_bypass_cnt; i++) if(!strcmp(g_bypass[i], bn)) idx = i;
+      if(on && idx < 0 && g_bypass_cnt < 16) snprintf(g_bypass[g_bypass_cnt++], 48, "%s", bn);
+      else if(!on && idx >= 0) { g_bypass[idx][0] = 0; for(int i = idx; i < g_bypass_cnt - 1; i++) memcpy(g_bypass[i], g_bypass[i+1], 48); g_bypass_cnt--; }
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err) lg("err", "bypass rebuild failed for %s", bn);
+      else { lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt); after_graph_change(c); g_dirty = 1; }
+      return 1;
+    }
+  }
   if(!strncmp(tmp, "undo", 4))
   {
     pthread_mutex_lock(&g_lock);
@@ -554,6 +570,92 @@ static int make_proxy(const char *in, const char *out, int maxdim)
 // previous graph, exports the template pipeline against a downscaled preview proxy,
 // restores the image's recipe sidecar (param overlay), and baselines history. Call with
 // g_lock held when re-opening at runtime.
+// is "name:inst" in the bypass set?
+static int is_bypassed(const char *ni)
+{
+  for(int i = 0; i < g_bypass_cnt; i++) if(!strcmp(g_bypass[i], ni)) return 1;
+  return 0;
+}
+
+// regenerate the cfg with bypassed modules routed around: every consumer of a bypassed
+// module's output is re-pointed to that module's main input source (fan-out safe), the
+// module's own connects (incl. side-inputs like luts) are dropped, and now-orphaned modules
+// are pruned. validated against vkdt-cli for colour/grade/filmsim/crop. returns the rewritten
+// file path if any module is bypassed, else the base path.
+static const char *effective_cfg(const char *base)
+{
+  if(g_bypass_cnt <= 0) return base;
+  FILE *f = fopen(base, "rb"); if(!f) return base;
+  static char buf[65536]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[n] = 0;
+  char *line[2048]; int nl = 0;
+  for(char *p = strtok(buf, "\r\n"); p && nl < 2048; p = strtok(0, "\r\n")) line[nl++] = p;
+
+  // pass 1: main-input source ("fA:iA:cA") for each bypassed module ("fB:iB")
+  char srck[16][48], srcv[16][96]; int srcn = 0;
+  for(int i = 0; i < nl; i++)
+  {
+    if(strncmp(line[i], "connect:", 8)) continue;
+    char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
+    for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
+    if(tn < 6) continue;
+    char to[48]; snprintf(to, sizeof(to), "%s:%s", tk[3], tk[4]);
+    if(!strcmp(tk[5], "input") && is_bypassed(to) && srcn < 16)
+    { snprintf(srck[srcn], 48, "%s", to); snprintf(srcv[srcn], 96, "%s:%s:%s", tk[0], tk[1], tk[2]); srcn++; }
+  }
+  // pass 2: build rewritten connects + the set of referenced modules
+  static char out[65536]; char *o = out, *e = out + sizeof(out);
+  char nc[256][96]; int ncn = 0; char ref[64][48]; int refn = 0;
+  for(int i = 0; i < nl; i++)
+  {
+    if(strncmp(line[i], "connect:", 8)) continue;
+    char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
+    for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
+    if(tn < 6) continue;
+    char from[48], to[48]; snprintf(from, 48, "%s:%s", tk[0], tk[1]); snprintf(to, 48, "%s:%s", tk[3], tk[4]);
+    if(is_bypassed(to)) continue;                       // drop connects INTO a bypassed module
+    char fA[16], iA[16], cA[16]; snprintf(fA, 16, "%s", tk[0]); snprintf(iA, 16, "%s", tk[1]); snprintf(cA, 16, "%s", tk[2]);
+    if(is_bypassed(from))
+    { // consumer of a bypassed output -> repoint to that module's input source
+      const char *s = 0; for(int k = 0; k < srcn; k++) if(!strcmp(srck[k], from)) { s = srcv[k]; break; }
+      if(!s) continue;                                  // no source -> drop
+      char sc[96]; snprintf(sc, sizeof(sc), "%s", s); char *st[3]; int sn = 0;
+      for(char *p = strtok(sc, ":"); p && sn < 3; p = strtok(0, ":")) st[sn++] = p;
+      if(sn < 3) continue;
+      snprintf(fA, 16, "%s", st[0]); snprintf(iA, 16, "%s", st[1]); snprintf(cA, 16, "%s", st[2]);
+    }
+    if(ncn < 256) snprintf(nc[ncn++], 96, "connect:%s:%s:%s:%s:%s:%s", fA, iA, cA, tk[3], tk[4], tk[5]);
+    char a[48]; snprintf(a, 48, "%s:%s", fA, iA);
+    int ha = 0, hb = 0; for(int k = 0; k < refn; k++) { if(!strcmp(ref[k], a)) ha = 1; if(!strcmp(ref[k], to)) hb = 1; }
+    if(!ha && refn < 64) snprintf(ref[refn++], 48, "%s", a);
+    if(!hb && refn < 64) snprintf(ref[refn++], 48, "%s", to);
+  }
+  // emit non-connect lines (drop bypassed + orphaned module lines), then the rewritten connects
+  for(int i = 0; i < nl; i++)
+  {
+    if(!strncmp(line[i], "connect:", 8)) continue;
+    if(!strncmp(line[i], "module:", 7))
+    {
+      char t[128]; snprintf(t, sizeof(t), "%s", line[i] + 7); char *tk[2]; int tn = 0;
+      for(char *p = strtok(t, ":"); p && tn < 2; p = strtok(0, ":")) tk[tn++] = p;
+      if(tn >= 2)
+      {
+        char ni[48]; snprintf(ni, 48, "%s:%s", tk[0], tk[1]);
+        if(is_bypassed(ni)) continue;
+        int referenced = 0; for(int k = 0; k < refn; k++) if(!strcmp(ref[k], ni)) { referenced = 1; break; }
+        const int keep = !strncmp(tk[0], "i-jpg", 5) || !strncmp(tk[0], "i-raw", 5) || !strcmp(ni, "display:main");
+        if(!referenced && !keep) continue;              // prune orphan
+      }
+    }
+    o += snprintf(o, e - o, "%s\n", line[i]);
+  }
+  for(int i = 0; i < ncn; i++) o += snprintf(o, e - o, "%s\n", nc[i]);
+
+  const char *path = "rabbit_eff.cfg";
+  FILE *w = fopen(path, "wb"); if(!w) return base;
+  fwrite(out, 1, o - out, w); fclose(w);
+  return path;
+}
+
 static int open_image(const char *image)
 {
   // pick pipeline + input by file type: raw -> i-raw graph, fed the ORIGINAL file (vkdt
@@ -561,7 +663,7 @@ static int open_image(const char *image)
   // small preview proxy. The proxy/decode runs BEFORE the graph teardown, so a bad file
   // leaves the current session intact.
   const int raw = image && is_raw_path(image);
-  const char *cfg = raw ? g_conf.cfg_raw : g_conf.cfg;
+  const char *cfg = effective_cfg(raw ? g_conf.cfg_raw : g_conf.cfg);   // route around bypassed modules
   const char *inmod = raw ? "i-raw" : "i-jpg";
   char proxypath[1024] = "", abspath[1024]; const char *use_image = image;
   if(image && !raw)
@@ -714,7 +816,7 @@ static int export_handler(struct mg_connection *c, void *u)
   dt_graph_t ex; dt_graph_init(&ex, s_queue_compute);
   snprintf(ex.searchpath, sizeof(ex.searchpath), ".");
   dt_graph_export_t p = {0};
-  p.p_cfgfile  = raw ? g_conf.cfg_raw : g_conf.cfg;
+  p.p_cfgfile  = effective_cfg(raw ? g_conf.cfg_raw : g_conf.cfg);   // export reflects bypassed modules
   p.output_cnt = 2;
   p.output[0].inst             = dt_token("main");
   p.output[0].mod              = dt_token("o-jpg");
