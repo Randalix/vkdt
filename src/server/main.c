@@ -1042,7 +1042,7 @@ int main(int argc, char *argv[])
   const char *opts[] = {
     "document_root",   g_conf.docroot,
     "listening_ports", g_conf.port,
-    "num_threads",     "4",
+    "num_threads",     "32",   // civetweb holds one worker per live connection (incl. the persistent /ws); 4 wedges as soon as a PWA fires parallel asset loads + the WebSocket
     "enable_directory_listing", "no",
     "tcp_nodelay",     "1",
     "static_file_max_age", "0",
