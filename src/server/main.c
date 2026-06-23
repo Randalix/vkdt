@@ -42,6 +42,8 @@ static dt_graph_t      g_graph;
 static pthread_mutex_t g_lock   = PTHREAD_MUTEX_INITIALIZER;
 static const char     *g_jpgbase = "preview";
 static char            g_jpgpath[512];
+static const char     *g_histbase = "histogram";  // second sink: the waveform histogram image
+static char            g_histpath[512];
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
@@ -157,6 +159,35 @@ static unsigned char *render_to_jpeg(size_t *out_len, double *render_ms, dt_grap
   return buf;
 }
 
+// binary WS frames carry a 1-byte type tag so the client can tell preview from histogram:
+//   0x00 = preview image, 0x01 = histogram (waveform) image. the client sniffs byte 0
+//   (a jpeg starts 0xFF, webp 'R'=0x52) so it stays compatible with an un-tagged old server.
+#define FRAME_PREVIEW 0x00
+#define FRAME_HIST    0x01
+static void ws_send_tagged(struct mg_connection *c, uint8_t type, const unsigned char *data, size_t n)
+{
+  unsigned char *buf = malloc(n + 1);
+  if(!buf) return;
+  buf[0] = type;
+  memcpy(buf + 1, data, n);
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)buf, n + 1);
+  free(buf);
+}
+
+// slurp a whole file into a fresh buffer. caller frees. NULL on failure.
+static unsigned char *slurp_file(const char *path, size_t *out_len)
+{
+  FILE *f = fopen(path, "rb");
+  if(!f) return NULL;
+  fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+  if(n <= 0) { fclose(f); return NULL; }
+  unsigned char *buf = malloc(n);
+  size_t rd = buf ? fread(buf, 1, n, f) : 0;
+  fclose(f);
+  if(!buf || rd != (size_t)n) { free(buf); return NULL; }
+  *out_len = n; return buf;
+}
+
 static void push_frame(struct mg_connection *c, dt_graph_run_t extra)
 {
   pthread_mutex_lock(&g_lock);
@@ -164,7 +195,21 @@ static void push_frame(struct mg_connection *c, dt_graph_run_t extra)
   unsigned char *b = render_to_jpeg(&n, &ms, extra);
   pthread_mutex_unlock(&g_lock);
   if(!b) return;
-  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n);
+  ws_send_tagged(c, FRAME_PREVIEW, b, n);
+  free(b);
+}
+
+// send the current histogram image (written by the last render's hist sink). the client
+// requests this (cmd `scope`) when the histogram widget is open and on drag-end — keeping
+// the histogram off the per-scrub-frame hot path.
+static void push_hist_frame(struct mg_connection *c)
+{
+  pthread_mutex_lock(&g_lock);
+  size_t n = 0;
+  unsigned char *b = slurp_file(g_histpath, &n);
+  pthread_mutex_unlock(&g_lock);
+  if(!b) return;
+  ws_send_tagged(c, FRAME_HIST, b, n);
   free(b);
 }
 
@@ -367,6 +412,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     return 1;
   }
 
+  if(!strncmp(tmp, "scope", 5)) { push_hist_frame(c); return 1; }   // histogram widget: send current waveform
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
   if(!strncmp(tmp, "undo", 4))
@@ -540,17 +586,26 @@ static int open_image(const char *image)
   snprintf(g_graph.searchpath, sizeof(g_graph.searchpath), ".");
   built = 1;
 
+  const dt_token_t sinkmod = g_conf.preview_webp ? dt_token("o-webp") : dt_token("o-jpg");
   dt_graph_export_t param = {0};
   param.p_cfgfile  = cfg;
-  param.output_cnt = 1;
+  param.output_cnt = 2;
   param.output[0].inst             = dt_token("main");
-  param.output[0].mod              = g_conf.preview_webp ? dt_token("o-webp") : dt_token("o-jpg");
+  param.output[0].mod              = sinkmod;
   param.output[0].p_filename       = g_jpgbase;
   param.output[0].quality          = g_conf.quality;
   param.output[0].colour_primaries = s_colour_primaries_srgb;
   param.output[0].colour_trc       = s_colour_trc_srgb;
   param.output[0].max_width        = g_conf.preview_max;
   param.output[0].max_height       = g_conf.preview_max;
+  // second sink: the waveform histogram (display:hist in the cfg). same format as the
+  // preview; streamed to the client's histogram widget on request (cmd `scope`).
+  param.output[1].inst             = dt_token("hist");
+  param.output[1].mod              = sinkmod;
+  param.output[1].p_filename       = g_histbase;
+  param.output[1].quality          = g_conf.quality;
+  param.output[1].colour_primaries = s_colour_primaries_srgb;
+  param.output[1].colour_trc       = s_colour_trc_srgb;
 
   char imgline[1280]; char *extra[1];
   if(image)
@@ -560,7 +615,8 @@ static int open_image(const char *image)
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
   { lg("err", "graph export failed for '%s'", cfg); return 1; }
-  snprintf(g_jpgpath, sizeof(g_jpgpath), g_conf.preview_webp ? "%s.webp" : "%s.jpg", g_jpgbase);
+  snprintf(g_jpgpath,  sizeof(g_jpgpath),  g_conf.preview_webp ? "%s.webp" : "%s.jpg", g_jpgbase);
+  snprintf(g_histpath, sizeof(g_histpath), g_conf.preview_webp ? "%s.webp" : "%s.jpg", g_histbase);
 
   // restore this image's recipe (param overlay onto the template; skip i-jpg input)
   g_recipe_path[0] = 0;
@@ -659,7 +715,7 @@ static int export_handler(struct mg_connection *c, void *u)
   snprintf(ex.searchpath, sizeof(ex.searchpath), ".");
   dt_graph_export_t p = {0};
   p.p_cfgfile  = raw ? g_conf.cfg_raw : g_conf.cfg;
-  p.output_cnt = 1;
+  p.output_cnt = 2;
   p.output[0].inst             = dt_token("main");
   p.output[0].mod              = dt_token("o-jpg");
   p.output[0].p_filename       = "rabbit_export";
@@ -668,6 +724,14 @@ static int export_handler(struct mg_connection *c, void *u)
   p.output[0].colour_trc       = s_colour_trc_srgb;
   p.output[0].max_width        = 0;   // size is controlled by the resize module below
   p.output[0].max_height       = 0;
+  // the cfg has a display:hist branch; replace it with a throwaway sink too so the
+  // headless export graph has no leftover display node. (the histogram file is ignored.)
+  p.output[1].inst             = dt_token("hist");
+  p.output[1].mod              = dt_token("o-jpg");
+  p.output[1].p_filename       = "rabbit_export_hist";
+  p.output[1].quality          = quality;
+  p.output[1].colour_primaries = s_colour_primaries_srgb;
+  p.output[1].colour_trc       = s_colour_trc_srgb;
   char imgline[1280];
   snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", raw ? "i-raw" : "i-jpg", g_cur_image);
   char *extra[1] = { imgline }; p.extra_param_cnt = 1; p.p_extra_param = extra;
