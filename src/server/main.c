@@ -51,6 +51,7 @@ static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
 static char            g_cur_image[1024];      // current ORIGINAL image (not the proxy) — for full-res export
 static volatile int    g_dirty = 0;           // edits pending an autosave
+static int             g_export_ver = 0;       // per-image export version counter (reset on open)
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
 static FILE           *g_logf = NULL;         // optional logfile (config: logfile=)
 
@@ -759,7 +760,7 @@ static int open_image(const char *image)
     lg("srv", "raw input <- %s", use_image);
   }
   // remember the ORIGINAL (absolute) image for full-res export
-  if(image) { char a[1024]; snprintf(g_cur_image, sizeof(g_cur_image), "%s", realpath(image, a) ? a : image); }
+  if(image) { char a[1024]; snprintf(g_cur_image, sizeof(g_cur_image), "%s", realpath(image, a) ? a : image); g_export_ver = 0; }
 
   static int built = 0;
   if(built) { dt_graph_history_cleanup(&g_graph); dt_graph_cleanup(&g_graph); }
@@ -960,11 +961,17 @@ static int export_handler(struct mg_connection *c, void *u)
             if(n > 0) { buf = malloc(n); if(fread(buf, 1, n, f) != (size_t)n) { free(buf); buf = 0; } } fclose(f); }
   }
   if(!buf) { lg("err", "export failed"); mg_printf(c, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"); return 500; }
-  const char *base = strrchr(g_cur_image, '/'); base = base ? base + 1 : g_cur_image;
+  // download filename: <source basename without extension>_v<NN>.jpg, version auto-incremented
+  // per image (so successive exports don't overwrite). NB: a web page can't set the download
+  // DIRECTORY (browser security) — the user picks the folder in their browser settings.
+  const char *bn = strrchr(g_cur_image, '/'); bn = bn ? bn + 1 : g_cur_image;
+  char base[256]; snprintf(base, sizeof(base), "%s", bn);
+  char *dot = strrchr(base, '.'); if(dot) *dot = 0;   // strip source extension
+  const int ver = ++g_export_ver;
   mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n"
-               "Content-Disposition: attachment; filename=\"rabbit_%s.jpg\"\r\nContent-Length: %ld\r\n\r\n", base, n);
+               "Content-Disposition: attachment; filename=\"%s_v%02d.jpg\"\r\nContent-Length: %ld\r\n\r\n", base, ver, n);
   mg_write(c, (const char *)buf, n); free(buf);
-  lg("srv", "export %s.jpg %ld B (q%d max%d)", base, n, quality, maxdim);
+  lg("srv", "export %s_v%02d.jpg %ld B (q%d max%d)", base, ver, n, quality, maxdim);
   return 200;
 }
 
