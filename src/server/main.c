@@ -54,7 +54,8 @@ static FILE           *g_logf = NULL;         // optional logfile (config: logfi
 static struct {
   char port[16], docroot[512], cfg[512], cfg_raw[512], image[1024], libdir[512], logfile[512];
   int  proxy_max, preview_max, quality;
-} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90 };
+  int  preview_webp;   // 1 = stream webp preview frames (o-webp) instead of jpeg (o-jpg)
+} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90, 0 };
 
 // raw photo extensions -> use the i-raw pipeline (no jpeg proxy; vkdt decodes the raw)
 static int is_raw_path(const char *p)
@@ -101,6 +102,7 @@ static void load_config(const char *path)
     else if(!strcmp(k,"proxy_max"))   g_conf.proxy_max   = atoi(v);
     else if(!strcmp(k,"preview_max")) g_conf.preview_max = atoi(v);
     else if(!strcmp(k,"quality"))     g_conf.quality     = atoi(v);
+    else if(!strcmp(k,"preview_format")) g_conf.preview_webp = !strcmp(v, "webp");
   }
   fclose(f);
 }
@@ -542,7 +544,7 @@ static int open_image(const char *image)
   param.p_cfgfile  = cfg;
   param.output_cnt = 1;
   param.output[0].inst             = dt_token("main");
-  param.output[0].mod              = dt_token("o-jpg");
+  param.output[0].mod              = g_conf.preview_webp ? dt_token("o-webp") : dt_token("o-jpg");
   param.output[0].p_filename       = g_jpgbase;
   param.output[0].quality          = g_conf.quality;
   param.output[0].colour_primaries = s_colour_primaries_srgb;
@@ -558,7 +560,7 @@ static int open_image(const char *image)
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
   { lg("err", "graph export failed for '%s'", cfg); return 1; }
-  snprintf(g_jpgpath, sizeof(g_jpgpath), "%s.jpg", g_jpgbase);
+  snprintf(g_jpgpath, sizeof(g_jpgpath), g_conf.preview_webp ? "%s.webp" : "%s.jpg", g_jpgbase);
 
   // restore this image's recipe (param overlay onto the template; skip i-jpg input)
   g_recipe_path[0] = 0;
@@ -741,7 +743,7 @@ int main(int argc, char *argv[])
   mkdir(g_conf.libdir, 0755);            // library / upload directory (relative to cwd)
   const char *image = g_conf.image[0] ? g_conf.image : NULL;
   if(open_image(image)) { lg("err", "initial open failed"); return 1; }
-  lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile);
+  lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s  preview=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile, g_conf.preview_webp ? "webp" : "jpeg");
 
   signal(SIGINT, on_sigint);
   mg_init_library(0);
