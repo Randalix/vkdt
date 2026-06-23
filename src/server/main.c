@@ -1047,6 +1047,7 @@ int main(int argc, char *argv[])
     "tcp_nodelay",     "1",
     "static_file_max_age", "0",
     "additional_header", "Cache-Control: no-store",  // never cache the client during dev
+    "extra_mime_types", ".webmanifest=application/manifest+json",  // PWA manifest (not in civetweb's builtin table)
     NULL
   };
   struct mg_callbacks cb; memset(&cb, 0, sizeof(cb));
