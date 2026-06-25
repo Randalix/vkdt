@@ -46,6 +46,10 @@ static const char     *g_histbase = "histogram";  // second sink: the waveform h
 static char            g_histpath[512];
 static char            g_bypass[16][48];           // bypassed modules ("name:inst") — routed around in the cfg
 static int             g_bypass_cnt = 0;
+// user-added modules spliced into an edge (inverse of bypass): each is inserted right after
+// `after` ("name:inst") on that module's `output` connector, fanning out to all its consumers.
+static struct { char mod[40]; char inst[16]; char after[48]; } g_insert[16];
+static int             g_insert_cnt = 0;
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
@@ -74,6 +78,7 @@ static int is_raw_path(const char *p)
 
 static void recipe_save(void);
 static int  open_image(const char *image);    // (re)build the warm graph for an image
+static int  is_inserted(const char *ni);      // is "name:inst" a user-added (spliced-in) module?
 
 // timestamped log to stderr + the configured logfile. tag groups the source (srv/cli/err).
 static void lg(const char *tag, const char *fmt, ...)
@@ -373,9 +378,68 @@ static void send_graph(struct mg_connection *c)
   }
   o += snprintf(o, e-o, "],\"bypassed\":[");   // routed-out modules (not in the graph) so the client can re-enable them
   for(int i = 0; i < g_bypass_cnt; i++) o += snprintf(o, e-o, "%s\"%s\"", i ? "," : "", g_bypass[i]);
+  o += snprintf(o, e-o, "],\"inserted\":[");   // user-added modules ("name:inst") so the client can mark + remove them
+  for(int i = 0; i < g_insert_cnt; i++) o += snprintf(o, e-o, "%s\"%s:%s\"", i ? "," : "", g_insert[i].mod, g_insert[i].inst);
   o += snprintf(o, e-o, "]}");
   pthread_mutex_unlock(&g_lock);
   mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
+}
+
+// send the catalog of modules the client can ADD: every loaded module class that has a clear
+// input->output chain (has_inout_chain) — i.e. exactly the modules that can be spliced inline
+// onto an edge. excludes sources/sinks/display and multi-output modules automatically.
+static void send_mods(struct mg_connection *c)
+{
+  static char buf[32768];
+  char *o = buf, *e = buf + sizeof(buf);
+  o += snprintf(o, e-o, "{\"type\":\"mods\",\"mods\":[");
+  int first = 1;
+  for(uint32_t i = 0; i < dt_pipe.num_modules; i++)
+  {
+    if(!dt_pipe.module[i].has_inout_chain) continue;
+    if(!first) o += snprintf(o, e-o, ","); first = 0;
+    o += snprintf(o, e-o, "\"%"PRItkn"\"", dt_token_str(dt_pipe.module[i].name));
+  }
+  o += snprintf(o, e-o, "]}");
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
+}
+
+// find a live module by "name:inst"; returns its modid or -1.
+static int find_modid(const char *nameinst)
+{
+  char ni[64]; snprintf(ni, sizeof(ni), "%s", nameinst);
+  char *colon = strrchr(ni, ':'); if(!colon) return -1; *colon = 0;
+  dt_token_t nm = dt_token(ni), in = dt_token(colon + 1);
+  for(int m = 0; m < g_graph.num_modules; m++)
+    if(g_graph.module[m].so && g_graph.module[m].name == nm && g_graph.module[m].inst == in) return m;
+  return -1;
+}
+
+// is `name` a module class that can be added (loaded + has an input->output chain)?
+static int is_addable(const char *name)
+{
+  dt_token_t nm = dt_token(name);
+  for(uint32_t i = 0; i < dt_pipe.num_modules; i++)
+    if(dt_pipe.module[i].has_inout_chain && dt_pipe.module[i].name == nm) return 1;
+  return 0;
+}
+
+// pick a free 2-digit instance for `name` not used by any live module or pending insert
+static void gen_inst(const char *name, char *out, int outsz)
+{
+  dt_token_t nm = dt_token(name);
+  for(int k = 1; k < 100; k++)
+  {
+    char cand[8]; snprintf(cand, sizeof(cand), "%02d", k);
+    dt_token_t ct = dt_token(cand);
+    int used = 0;
+    for(int m = 0; m < g_graph.num_modules && !used; m++)
+      if(g_graph.module[m].so && g_graph.module[m].name == nm && g_graph.module[m].inst == ct) used = 1;
+    for(int i = 0; i < g_insert_cnt && !used; i++)
+      if(!strcmp(g_insert[i].mod, name) && !strcmp(g_insert[i].inst, cand)) used = 1;
+    if(!used) { snprintf(out, outsz, "%s", cand); return; }
+  }
+  snprintf(out, outsz, "99");
 }
 
 // after a history op (undo/redo/jump/reset) the whole edit state changed: re-render,
@@ -432,6 +496,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   if(!strncmp(tmp, "scope", 5)) { push_hist_frame(c); return 1; }   // histogram widget: send current waveform
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
+  if(!strncmp(tmp, "mods", 4))  { send_mods(c);  return 1; }   // catalog of addable modules
   { int mi;   // fitcrop <modid> : auto-fit the crop to the rotated inscribed rect (vkdt's own geometry, item 32 v2)
     if(sscanf(tmp, "fitcrop %d", &mi) == 1 && mi >= 0 && mi < g_graph.num_modules)
     {
@@ -468,6 +533,55 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
         pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
       }
       lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt);
+      after_graph_change(c); send_graph(c);
+      return 1;
+    }
+  }
+  { char nm[40], af[48];   // addmod <name> <after:inst> : splice a new module onto after's output edge (inverse of bypass)
+    if(sscanf(tmp, "addmod %39s %47s", nm, af) == 2)
+    {
+      if(!is_addable(nm)) { lg("err", "addmod: unknown/non-chain module %s", nm); return 1; }
+      // require that `after` exists and its output feeds at least one consumer — else the new
+      // module would be an orphan (no edge to splice into).
+      pthread_mutex_lock(&g_lock);
+      int mi = find_modid(af), consumers = 0;
+      if(mi >= 0) { int mo[16], co[16]; consumers = dt_module_get_module_after(&g_graph, g_graph.module + mi, mo, co, 16); }
+      pthread_mutex_unlock(&g_lock);
+      if(consumers <= 0) { lg("err", "addmod: %s has no output consumer to splice into", af); return 1; }
+      if(g_insert_cnt >= 16) { lg("err", "addmod: insert limit reached"); return 1; }
+      char inst[16]; gen_inst(nm, inst, sizeof(inst));
+      int idx = g_insert_cnt;
+      snprintf(g_insert[idx].mod,   sizeof(g_insert[idx].mod),   "%s", nm);
+      snprintf(g_insert[idx].inst,  sizeof(g_insert[idx].inst),  "%s", inst);
+      snprintf(g_insert[idx].after, sizeof(g_insert[idx].after), "%s", af);
+      g_insert_cnt++;
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err)
+      { // incompatible connectors / bad splice -> revert and rebuild the last good graph
+        lg("err", "addmod rebuild failed for %s after %s — reverting", nm, af);
+        g_insert_cnt--;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      }
+      else lg("srv", "addmod %s:%s after %s (%d total)", nm, inst, af, g_insert_cnt);
+      after_graph_change(c); send_graph(c);
+      return 1;
+    }
+  }
+  { char ni[48];   // rmmod <name:inst> : remove a user-added (inserted) module (template modules use bypass instead)
+    if(sscanf(tmp, "rmmod %47s", ni) == 1)
+    {
+      if(!is_inserted(ni)) { lg("err", "rmmod: %s is not a user-added module", ni); return 1; }
+      struct { char mod[40]; char inst[16]; char after[48]; } save[16]; int savecnt = g_insert_cnt;
+      memcpy(save, g_insert, sizeof(save));
+      for(int i = 0; i < g_insert_cnt; i++)
+      { char k[64]; snprintf(k, sizeof(k), "%s:%s", g_insert[i].mod, g_insert[i].inst);
+        if(!strcmp(k, ni)) { for(int j = i; j < g_insert_cnt - 1; j++) g_insert[j] = g_insert[j+1]; g_insert_cnt--; break; } }
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err)
+      { lg("err", "rmmod rebuild failed for %s — reverting", ni);
+        memcpy(g_insert, save, sizeof(save)); g_insert_cnt = savecnt;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
+      else lg("srv", "rmmod %s (%d total)", ni, g_insert_cnt);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -692,82 +806,132 @@ static int is_bypassed(const char *ni)
   return 0;
 }
 
-// regenerate the cfg with bypassed modules routed around: every consumer of a bypassed
-// module's output is re-pointed to that module's main input source (fan-out safe), the
-// module's own connects (incl. side-inputs like luts) are dropped, and now-orphaned modules
-// are pruned. validated against vkdt-cli for colour/grade/filmsim/crop. returns the rewritten
-// file path if any module is bypassed, else the base path.
+// is "name:inst" in the user-added (inserted) set?
+static int is_inserted(const char *ni)
+{
+  for(int i = 0; i < g_insert_cnt; i++)
+  { char k[64]; snprintf(k, sizeof(k), "%s:%s", g_insert[i].mod, g_insert[i].inst); if(!strcmp(k, ni)) return 1; }
+  return 0;
+}
+
+// splice the user-added modules into the cfg text (in place, in cap bytes): for each insert
+// "NEW after AFTER:inst", add NEW's module line and re-point every consumer of AFTER's `output`
+// connector through NEW (fan-out safe). NEW's module line is emitted FIRST so every connect
+// referencing NEW comes after its declaration (vkdt resolves modules in cfg order).
+static void apply_inserts(char *text, size_t cap)
+{
+  for(int j = 0; j < g_insert_cnt; j++)
+  {
+    static char work[65536]; snprintf(work, sizeof(work), "%s", text);   // strtok destroys; work on a copy
+    char *line[2048]; int nl = 0;
+    for(char *p = strtok(work, "\r\n"); p && nl < 2048; p = strtok(0, "\r\n")) line[nl++] = p;
+    char fromkey[80]; snprintf(fromkey, sizeof(fromkey), "%s:output", g_insert[j].after);   // e.g. "colour:01:output"
+    static char out2[65536]; char *o = out2, *e = out2 + sizeof(out2);
+    // declare NEW first, then feed it from AFTER:output (its module line precedes both connects below)
+    o += snprintf(o, e - o, "module:%s:%s:0:0\n", g_insert[j].mod, g_insert[j].inst);
+    for(int i = 0; i < nl && o < e; i++)
+    {
+      if(!strncmp(line[i], "connect:", 8))
+      {
+        char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
+        for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
+        if(tn >= 6)
+        {
+          char ff[80]; snprintf(ff, sizeof(ff), "%s:%s:%s", tk[0], tk[1], tk[2]);
+          if(!strcmp(ff, fromkey))   // this consumer was fed by AFTER:output -> feed it from NEW:output
+          { o += snprintf(o, e - o, "connect:%s:%s:output:%s:%s:%s\n", g_insert[j].mod, g_insert[j].inst, tk[3], tk[4], tk[5]); continue; }
+        }
+      }
+      o += snprintf(o, e - o, "%s\n", line[i]);
+    }
+    if(o < e) o += snprintf(o, e - o, "connect:%s:output:%s:%s:input\n", g_insert[j].after, g_insert[j].mod, g_insert[j].inst);
+    snprintf(text, cap, "%s", out2);
+  }
+}
+
+// regenerate the cfg with bypassed modules routed around and user-added modules spliced in:
+// bypass re-points every consumer of a bypassed module's output to that module's main input
+// source (fan-out safe), drops the module's own connects (incl. side-inputs like luts) and
+// prunes orphans; then apply_inserts() splices the added modules into their target edges.
+// validated against vkdt-cli for colour/grade/filmsim/crop. returns the rewritten file path if
+// anything changed, else the base path.
 static const char *effective_cfg(const char *base)
 {
-  if(g_bypass_cnt <= 0) return base;
+  if(g_bypass_cnt <= 0 && g_insert_cnt <= 0) return base;
   FILE *f = fopen(base, "rb"); if(!f) return base;
   static char buf[65536]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[n] = 0;
   char *line[2048]; int nl = 0;
   for(char *p = strtok(buf, "\r\n"); p && nl < 2048; p = strtok(0, "\r\n")) line[nl++] = p;
 
-  // pass 1: main-input source ("fA:iA:cA") for each bypassed module ("fB:iB")
-  char srck[16][48], srcv[16][96]; int srcn = 0;
-  for(int i = 0; i < nl; i++)
-  {
-    if(strncmp(line[i], "connect:", 8)) continue;
-    char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
-    for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
-    if(tn < 6) continue;
-    char to[48]; snprintf(to, sizeof(to), "%s:%s", tk[3], tk[4]);
-    if(!strcmp(tk[5], "input") && is_bypassed(to) && srcn < 16)
-    { snprintf(srck[srcn], 48, "%s", to); snprintf(srcv[srcn], 96, "%s:%s:%s", tk[0], tk[1], tk[2]); srcn++; }
-  }
-  // pass 2: build rewritten connects + the set of referenced modules
   static char out[65536]; char *o = out, *e = out + sizeof(out);
-  char nc[256][96]; int ncn = 0; char ref[64][48]; int refn = 0;
-  for(int i = 0; i < nl; i++)
+  if(g_bypass_cnt > 0)
   {
-    if(strncmp(line[i], "connect:", 8)) continue;
-    char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
-    for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
-    if(tn < 6) continue;
-    char from[48], to[48]; snprintf(from, 48, "%s:%s", tk[0], tk[1]); snprintf(to, 48, "%s:%s", tk[3], tk[4]);
-    if(is_bypassed(to)) continue;                       // drop connects INTO a bypassed module
-    char fA[16], iA[16], cA[16]; snprintf(fA, 16, "%s", tk[0]); snprintf(iA, 16, "%s", tk[1]); snprintf(cA, 16, "%s", tk[2]);
-    if(is_bypassed(from))
-    { // consumer of a bypassed output -> repoint to that module's input source
-      const char *s = 0; for(int k = 0; k < srcn; k++) if(!strcmp(srck[k], from)) { s = srcv[k]; break; }
-      if(!s) continue;                                  // no source -> drop
-      char sc[96]; snprintf(sc, sizeof(sc), "%s", s); char *st[3]; int sn = 0;
-      for(char *p = strtok(sc, ":"); p && sn < 3; p = strtok(0, ":")) st[sn++] = p;
-      if(sn < 3) continue;
-      snprintf(fA, 16, "%s", st[0]); snprintf(iA, 16, "%s", st[1]); snprintf(cA, 16, "%s", st[2]);
-    }
-    if(ncn < 256) snprintf(nc[ncn++], 96, "connect:%s:%s:%s:%s:%s:%s", fA, iA, cA, tk[3], tk[4], tk[5]);
-    char a[48]; snprintf(a, 48, "%s:%s", fA, iA);
-    int ha = 0, hb = 0; for(int k = 0; k < refn; k++) { if(!strcmp(ref[k], a)) ha = 1; if(!strcmp(ref[k], to)) hb = 1; }
-    if(!ha && refn < 64) snprintf(ref[refn++], 48, "%s", a);
-    if(!hb && refn < 64) snprintf(ref[refn++], 48, "%s", to);
-  }
-  // emit non-connect lines (drop bypassed + orphaned module lines), then the rewritten connects
-  for(int i = 0; i < nl; i++)
-  {
-    if(!strncmp(line[i], "connect:", 8)) continue;
-    if(!strncmp(line[i], "module:", 7))
+    // pass 1: main-input source ("fA:iA:cA") for each bypassed module ("fB:iB")
+    char srck[16][48], srcv[16][96]; int srcn = 0;
+    for(int i = 0; i < nl; i++)
     {
-      char t[128]; snprintf(t, sizeof(t), "%s", line[i] + 7); char *tk[2]; int tn = 0;
-      for(char *p = strtok(t, ":"); p && tn < 2; p = strtok(0, ":")) tk[tn++] = p;
-      if(tn >= 2)
-      {
-        char ni[48]; snprintf(ni, 48, "%s:%s", tk[0], tk[1]);
-        if(is_bypassed(ni)) continue;
-        int referenced = 0; for(int k = 0; k < refn; k++) if(!strcmp(ref[k], ni)) { referenced = 1; break; }
-        const int keep = !strncmp(tk[0], "i-jpg", 5) || !strncmp(tk[0], "i-raw", 5) || !strcmp(ni, "display:main");
-        if(!referenced && !keep) continue;              // prune orphan
-      }
+      if(strncmp(line[i], "connect:", 8)) continue;
+      char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
+      for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
+      if(tn < 6) continue;
+      char to[48]; snprintf(to, sizeof(to), "%s:%s", tk[3], tk[4]);
+      if(!strcmp(tk[5], "input") && is_bypassed(to) && srcn < 16)
+      { snprintf(srck[srcn], 48, "%s", to); snprintf(srcv[srcn], 96, "%s:%s:%s", tk[0], tk[1], tk[2]); srcn++; }
     }
-    if(o < e) o += snprintf(o, e - o, "%s\n", line[i]);   // defensive: never snprintf with a wrapped size
+    // pass 2: build rewritten connects + the set of referenced modules
+    char nc[256][96]; int ncn = 0; char ref[64][48]; int refn = 0;
+    for(int i = 0; i < nl; i++)
+    {
+      if(strncmp(line[i], "connect:", 8)) continue;
+      char t[256]; snprintf(t, sizeof(t), "%s", line[i] + 8); char *tk[6]; int tn = 0;
+      for(char *p = strtok(t, ":"); p && tn < 6; p = strtok(0, ":")) tk[tn++] = p;
+      if(tn < 6) continue;
+      char from[48], to[48]; snprintf(from, 48, "%s:%s", tk[0], tk[1]); snprintf(to, 48, "%s:%s", tk[3], tk[4]);
+      if(is_bypassed(to)) continue;                       // drop connects INTO a bypassed module
+      char fA[16], iA[16], cA[16]; snprintf(fA, 16, "%s", tk[0]); snprintf(iA, 16, "%s", tk[1]); snprintf(cA, 16, "%s", tk[2]);
+      if(is_bypassed(from))
+      { // consumer of a bypassed output -> repoint to that module's input source
+        const char *s = 0; for(int k = 0; k < srcn; k++) if(!strcmp(srck[k], from)) { s = srcv[k]; break; }
+        if(!s) continue;                                  // no source -> drop
+        char sc[96]; snprintf(sc, sizeof(sc), "%s", s); char *st[3]; int sn = 0;
+        for(char *p = strtok(sc, ":"); p && sn < 3; p = strtok(0, ":")) st[sn++] = p;
+        if(sn < 3) continue;
+        snprintf(fA, 16, "%s", st[0]); snprintf(iA, 16, "%s", st[1]); snprintf(cA, 16, "%s", st[2]);
+      }
+      if(ncn < 256) snprintf(nc[ncn++], 96, "connect:%s:%s:%s:%s:%s:%s", fA, iA, cA, tk[3], tk[4], tk[5]);
+      char a[48]; snprintf(a, 48, "%s:%s", fA, iA);
+      int ha = 0, hb = 0; for(int k = 0; k < refn; k++) { if(!strcmp(ref[k], a)) ha = 1; if(!strcmp(ref[k], to)) hb = 1; }
+      if(!ha && refn < 64) snprintf(ref[refn++], 48, "%s", a);
+      if(!hb && refn < 64) snprintf(ref[refn++], 48, "%s", to);
+    }
+    // emit non-connect lines (drop bypassed + orphaned module lines), then the rewritten connects
+    for(int i = 0; i < nl; i++)
+    {
+      if(!strncmp(line[i], "connect:", 8)) continue;
+      if(!strncmp(line[i], "module:", 7))
+      {
+        char t[128]; snprintf(t, sizeof(t), "%s", line[i] + 7); char *tk[2]; int tn = 0;
+        for(char *p = strtok(t, ":"); p && tn < 2; p = strtok(0, ":")) tk[tn++] = p;
+        if(tn >= 2)
+        {
+          char ni[48]; snprintf(ni, 48, "%s:%s", tk[0], tk[1]);
+          if(is_bypassed(ni)) continue;
+          int referenced = 0; for(int k = 0; k < refn; k++) if(!strcmp(ref[k], ni)) { referenced = 1; break; }
+          const int keep = !strncmp(tk[0], "i-jpg", 5) || !strncmp(tk[0], "i-raw", 5) || !strcmp(ni, "display:main");
+          if(!referenced && !keep) continue;              // prune orphan
+        }
+      }
+      if(o < e) o += snprintf(o, e - o, "%s\n", line[i]);   // defensive: never snprintf with a wrapped size
+    }
+    for(int i = 0; i < ncn && o < e; i++) o += snprintf(o, e - o, "%s\n", nc[i]);
   }
-  for(int i = 0; i < ncn && o < e; i++) o += snprintf(o, e - o, "%s\n", nc[i]);
+  else for(int i = 0; i < nl && o < e; i++) o += snprintf(o, e - o, "%s\n", line[i]);   // no bypass: verbatim
+
+  if(g_insert_cnt > 0) apply_inserts(out, sizeof(out));
 
   const char *path = "rabbit_eff.cfg";
   FILE *w = fopen(path, "wb"); if(!w) return base;
-  fwrite(out, 1, o - out, w); fclose(w);
+  fwrite(out, 1, strlen(out), w); fclose(w);   // apply_inserts may have rewritten out -> use strlen, not o-out
   return path;
 }
 
