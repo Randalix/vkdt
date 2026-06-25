@@ -450,22 +450,27 @@ static void gen_inst(const char *name, char *out, int outsz)
 
 // does following output edges downstream from `start` ever reach `target`? used as a cycle
 // guard before a rewire: adding the edge `target.input <- start.output` would close a loop iff
-// `start` is already reachable downstream from `target` (target ->* start). call with g_lock held.
+// `start` is already reachable downstream from `target` (target ->* start). consumers are found
+// by scanning every module's input connectors for `connected.i == m`, so ALL output connectors
+// are followed (not only the canonically-named `output`). `seen` is marked at push, so each
+// module enters the stack at most once -> stack bounded by num_modules. call with g_lock held.
 static int reaches_downstream(int start, int target)
 {
-  static char seen[4096];   // num_modules is small; static avoids a big stack frame
-  if(g_graph.num_modules > (int)sizeof(seen)) return 1;   // pathological: refuse rather than overrun
+  static char seen[4096]; static int stack[4096];
+  if(g_graph.num_modules > (int)(sizeof(seen)/sizeof(seen[0]))) return 1;   // pathological: refuse rather than overrun
   memset(seen, 0, sizeof(seen));
-  int stack[512], sp = 0; stack[sp++] = start;
+  int sp = 0; seen[start] = 1; stack[sp++] = start;
   while(sp > 0)
   {
     int m = stack[--sp];
     if(m == target) return 1;
-    if(m < 0 || m >= g_graph.num_modules || seen[m]) continue;
-    seen[m] = 1;
-    int mo[64], co[64];
-    int n = dt_module_get_module_after(&g_graph, g_graph.module + m, mo, co, 64);
-    for(int i = 0; i < n && sp < 512; i++) stack[sp++] = mo[i];
+    for(int x = 0; x < g_graph.num_modules; x++)   // x is a consumer of m if any of its inputs is fed by m
+    {
+      dt_module_t *mx = g_graph.module + x; if(!mx->so || seen[x]) continue;
+      for(int cc = 0; cc < mx->num_connectors; cc++)
+        if(dt_connector_input(mx->connector + cc) && mx->connector[cc].connected.i == m)
+        { seen[x] = 1; stack[sp++] = x; break; }
+    }
   }
   return 0;
 }
@@ -625,9 +630,12 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       { // resolve to's first input connector and from's first output connector -> "name:inst:conn"
         dt_module_t *mt = g_graph.module + tm, *mf = g_graph.module + fm;
         int tc = -1, fc = -1;
-        for(int cc = 0; cc < mt->num_connectors; cc++) if(dt_connector_input (mt->connector + cc)) { tc = cc; break; }
+        // resolve to's input as the first CONNECTED input (the edge the client's input dot stands
+        // for) — not merely index 0, so the rewrite drops the real existing connect rather than
+        // appending a second edge on a different (unconnected) input of a multi-input module.
+        for(int cc = 0; cc < mt->num_connectors; cc++) if(dt_connector_input (mt->connector + cc) && mt->connector[cc].connected.i >= 0) { tc = cc; break; }
         for(int cc = 0; cc < mf->num_connectors; cc++) if(dt_connector_output(mf->connector + cc)) { fc = cc; break; }
-        if(tc < 0 || fc < 0) ok = 0;                            // to has no input / from has no output
+        if(tc < 0 || fc < 0) ok = 0;                            // to has no connected input / from has no output
         else if(reaches_downstream(tm, fm)) ok = 0;             // cycle guard: from is downstream of to
         else
         {
@@ -1118,12 +1126,13 @@ static int open_image(const char *image)
 static void recipe_save(void)
 {
   if(!g_recipe_path[0]) return;
-  // never persist while a module is bypassed OR an input is rewired: the built graph is the
-  // routed-around / repointed one, so saving would bake that runtime view into the sidecar
-  // (bypass: drop the module + its params = edit loss; rewire: lose the original wiring, so a
-  // later un-rewire couldn't restore it). both are runtime-only views; the recipe stays at the
-  // last full-graph state and clearing the overlay restores everything intact.
-  if(g_bypass_cnt > 0 || g_rewire_cnt > 0) return;
+  // never persist while a module is bypassed: the built graph is the routed-around one, so the
+  // bypassed module's params are missing from the live graph -> writing the sidecar would drop
+  // them (un-bypass would restore them at defaults = edit loss). bypass is a runtime-only view;
+  // the recipe stays at the last full-graph state and un-bypass restores everything intact.
+  // (rewire is NOT guarded: it drops no module, so all params are still written, and the reload
+  // path applies only `param:` lines from the sidecar — the rewired connects are inert there.)
+  if(g_bypass_cnt > 0) return;
   pthread_mutex_lock(&g_lock);
   int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
   pthread_mutex_unlock(&g_lock);
