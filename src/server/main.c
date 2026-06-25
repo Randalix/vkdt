@@ -37,6 +37,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <jpeglib.h>
+#include "cfg_rewire.h"   // pure rewire cfg-transform (shared with rewire_test.c)
 
 static dt_graph_t      g_graph;
 static pthread_mutex_t g_lock   = PTHREAD_MUTEX_INITIALIZER;
@@ -50,6 +51,10 @@ static int             g_bypass_cnt = 0;
 // `after` ("name:inst") on that module's `output` connector, fanning out to all its consumers.
 static struct { char mod[40]; char inst[16]; char after[48]; } g_insert[16];
 static int             g_insert_cnt = 0;
+// user re-wirings: each repoints a module's input connector to a new output source. stored fully
+// resolved ("name:inst:conn") so they survive graph rebuilds (modids aren't stable, tokens are).
+static rb_rewire_t     g_rewire[16];
+static int             g_rewire_cnt = 0;
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
@@ -443,6 +448,28 @@ static void gen_inst(const char *name, char *out, int outsz)
   snprintf(out, outsz, "99");
 }
 
+// does following output edges downstream from `start` ever reach `target`? used as a cycle
+// guard before a rewire: adding the edge `target.input <- start.output` would close a loop iff
+// `start` is already reachable downstream from `target` (target ->* start). call with g_lock held.
+static int reaches_downstream(int start, int target)
+{
+  static char seen[4096];   // num_modules is small; static avoids a big stack frame
+  if(g_graph.num_modules > (int)sizeof(seen)) return 1;   // pathological: refuse rather than overrun
+  memset(seen, 0, sizeof(seen));
+  int stack[512], sp = 0; stack[sp++] = start;
+  while(sp > 0)
+  {
+    int m = stack[--sp];
+    if(m == target) return 1;
+    if(m < 0 || m >= g_graph.num_modules || seen[m]) continue;
+    seen[m] = 1;
+    int mo[64], co[64];
+    int n = dt_module_get_module_after(&g_graph, g_graph.module + m, mo, co, 64);
+    for(int i = 0; i < n && sp < 512; i++) stack[sp++] = mo[i];
+  }
+  return 0;
+}
+
 // after a history op (undo/redo/jump/reset) the whole edit state changed: re-render,
 // re-send the dynamic menu (so the client's param values stay in sync) and the history.
 static void after_graph_change(struct mg_connection *c)
@@ -583,6 +610,50 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
         memcpy(g_insert, save, sizeof(save)); g_insert_cnt = savecnt;
         pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
       else lg("srv", "rmmod %s (%d total)", ni, g_insert_cnt);
+      after_graph_change(c); send_graph(c);
+      return 1;
+    }
+  }
+  { int tm, fm;   // rewire <to_modid> <from_modid> : repoint to's main input to from's main output
+    if(sscanf(tmp, "rewire %d %d", &tm, &fm) == 2)
+    {
+      pthread_mutex_lock(&g_lock);
+      int ok = 1; char tokey[64] = "", fromval[80] = "";
+      if(tm < 0 || tm >= g_graph.num_modules || fm < 0 || fm >= g_graph.num_modules || tm == fm) ok = 0;
+      else if(!g_graph.module[tm].so || !g_graph.module[fm].so) ok = 0;
+      else
+      { // resolve to's first input connector and from's first output connector -> "name:inst:conn"
+        dt_module_t *mt = g_graph.module + tm, *mf = g_graph.module + fm;
+        int tc = -1, fc = -1;
+        for(int cc = 0; cc < mt->num_connectors; cc++) if(dt_connector_input (mt->connector + cc)) { tc = cc; break; }
+        for(int cc = 0; cc < mf->num_connectors; cc++) if(dt_connector_output(mf->connector + cc)) { fc = cc; break; }
+        if(tc < 0 || fc < 0) ok = 0;                            // to has no input / from has no output
+        else if(reaches_downstream(tm, fm)) ok = 0;             // cycle guard: from is downstream of to
+        else
+        {
+          snprintf(tokey,   sizeof(tokey),   "%"PRItkn":%"PRItkn":%"PRItkn,
+              dt_token_str(mt->name), dt_token_str(mt->inst), dt_token_str(mt->connector[tc].name));
+          snprintf(fromval, sizeof(fromval), "%"PRItkn":%"PRItkn":%"PRItkn,
+              dt_token_str(mf->name), dt_token_str(mf->inst), dt_token_str(mf->connector[fc].name));
+        }
+      }
+      pthread_mutex_unlock(&g_lock);
+      if(!ok) { lg("err", "rewire %d <- %d rejected (bad id / no connector / cycle)", tm, fm); send_graph(c); return 1; }
+      // snapshot for rollback; dedupe by `to` (an input has exactly one source) — last wins
+      rb_rewire_t save[16]; int savecnt = g_rewire_cnt; memcpy(save, g_rewire, sizeof(save));
+      int idx = -1; for(int i = 0; i < g_rewire_cnt; i++) if(!strcmp(g_rewire[i].to, tokey)) idx = i;
+      if(idx < 0 && g_rewire_cnt < 16) idx = g_rewire_cnt++;
+      if(idx < 0) { lg("err", "rewire: limit reached"); send_graph(c); return 1; }
+      snprintf(g_rewire[idx].to, sizeof(g_rewire[idx].to), "%s", tokey);
+      snprintf(g_rewire[idx].from, sizeof(g_rewire[idx].from), "%s", fromval);
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err)
+      { // incompatible connectors / bad rewrite -> revert and rebuild the last good graph
+        lg("err", "rewire rebuild failed (%s <- %s) — reverting", tokey, fromval);
+        memcpy(g_rewire, save, sizeof(save)); g_rewire_cnt = savecnt;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      }
+      else lg("srv", "rewire %s <- %s (%d total)", tokey, fromval, g_rewire_cnt);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -863,9 +934,11 @@ static int g_cfg_overflow;   // set by effective_cfg if the rewrite truncated; o
 static const char *effective_cfg(const char *base)
 {
   g_cfg_overflow = 0;
-  if(g_bypass_cnt <= 0 && g_insert_cnt <= 0) return base;
+  if(g_bypass_cnt <= 0 && g_insert_cnt <= 0 && g_rewire_cnt <= 0) return base;
   FILE *f = fopen(base, "rb"); if(!f) return base;
   static char buf[65536]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[n] = 0;
+  // rewire pass FIRST: edits the base connect lines (repoint inputs) before bypass/insert run on top
+  if(rb_apply_rewires(buf, sizeof(buf), g_rewire, g_rewire_cnt)) g_cfg_overflow = 1;
   char *line[2048]; int nl = 0;
   for(char *p = strtok(buf, "\r\n"); p && nl < 2048; p = strtok(0, "\r\n")) line[nl++] = p;
 
@@ -1045,11 +1118,12 @@ static int open_image(const char *image)
 static void recipe_save(void)
 {
   if(!g_recipe_path[0]) return;
-  // never persist while a module is bypassed: the built graph is the routed-around one, so
-  // saving would drop the bypassed module + its params from the sidecar (un-bypass would
-  // restore them at defaults = edit loss). bypass is a runtime-only view; the recipe stays
-  // at the last full-graph state and un-bypass restores everything intact.
-  if(g_bypass_cnt > 0) return;
+  // never persist while a module is bypassed OR an input is rewired: the built graph is the
+  // routed-around / repointed one, so saving would bake that runtime view into the sidecar
+  // (bypass: drop the module + its params = edit loss; rewire: lose the original wiring, so a
+  // later un-rewire couldn't restore it). both are runtime-only views; the recipe stays at the
+  // last full-graph state and clearing the overlay restores everything intact.
+  if(g_bypass_cnt > 0 || g_rewire_cnt > 0) return;
   pthread_mutex_lock(&g_lock);
   int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
   pthread_mutex_unlock(&g_lock);
