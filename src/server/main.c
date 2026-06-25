@@ -394,14 +394,15 @@ static void send_mods(struct mg_connection *c)
   char *o = buf, *e = buf + sizeof(buf);
   o += snprintf(o, e-o, "{\"type\":\"mods\",\"mods\":[");
   int first = 1;
-  for(uint32_t i = 0; i < dt_pipe.num_modules; i++)
+  for(uint32_t i = 0; i < dt_pipe.num_modules && o < e; i++)
   {
     if(!dt_pipe.module[i].has_inout_chain) continue;
     if(!first) o += snprintf(o, e-o, ","); first = 0;
-    o += snprintf(o, e-o, "\"%"PRItkn"\"", dt_token_str(dt_pipe.module[i].name));
+    if(o < e) o += snprintf(o, e-o, "\"%"PRItkn"\"", dt_token_str(dt_pipe.module[i].name));
   }
-  o += snprintf(o, e-o, "]}");
-  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
+  if(o < e) o += snprintf(o, e-o, "]}");
+  // snprintf returns the would-be length, so o can run past e on overflow; clamp the write.
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o > e ? (size_t)(e-buf) : (size_t)(o-buf));
 }
 
 // find a live module by "name:inst"; returns its modid or -1.
@@ -818,7 +819,8 @@ static int is_inserted(const char *ni)
 // "NEW after AFTER:inst", add NEW's module line and re-point every consumer of AFTER's `output`
 // connector through NEW (fan-out safe). NEW's module line is emitted FIRST so every connect
 // referencing NEW comes after its declaration (vkdt resolves modules in cfg order).
-static void apply_inserts(char *text, size_t cap)
+// returns 1 if the rewrite overflowed its scratch buffer (cfg would be truncated/malformed -> caller must treat as an error and roll back), else 0.
+static int apply_inserts(char *text, size_t cap)
 {
   for(int j = 0; j < g_insert_cnt; j++)
   {
@@ -845,8 +847,10 @@ static void apply_inserts(char *text, size_t cap)
       o += snprintf(o, e - o, "%s\n", line[i]);
     }
     if(o < e) o += snprintf(o, e - o, "connect:%s:output:%s:%s:input\n", g_insert[j].after, g_insert[j].mod, g_insert[j].inst);
+    if(o >= e) return 1;   // overflowed -> out2 is truncated; bail so the caller rolls back instead of building a malformed graph
     snprintf(text, cap, "%s", out2);
   }
+  return 0;
 }
 
 // regenerate the cfg with bypassed modules routed around and user-added modules spliced in:
@@ -855,8 +859,10 @@ static void apply_inserts(char *text, size_t cap)
 // prunes orphans; then apply_inserts() splices the added modules into their target edges.
 // validated against vkdt-cli for colour/grade/filmsim/crop. returns the rewritten file path if
 // anything changed, else the base path.
+static int g_cfg_overflow;   // set by effective_cfg if the rewrite truncated; open_image rejects -> caller rolls back
 static const char *effective_cfg(const char *base)
 {
+  g_cfg_overflow = 0;
   if(g_bypass_cnt <= 0 && g_insert_cnt <= 0) return base;
   FILE *f = fopen(base, "rb"); if(!f) return base;
   static char buf[65536]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[n] = 0;
@@ -927,7 +933,8 @@ static const char *effective_cfg(const char *base)
   }
   else for(int i = 0; i < nl && o < e; i++) o += snprintf(o, e - o, "%s\n", line[i]);   // no bypass: verbatim
 
-  if(g_insert_cnt > 0) apply_inserts(out, sizeof(out));
+  if(o >= e) g_cfg_overflow = 1;   // bypass pass truncated the cfg -> caller must reject
+  if(g_insert_cnt > 0 && apply_inserts(out, sizeof(out))) g_cfg_overflow = 1;
 
   const char *path = "rabbit_eff.cfg";
   FILE *w = fopen(path, "wb"); if(!w) return base;
@@ -943,6 +950,7 @@ static int open_image(const char *image)
   // leaves the current session intact.
   const int raw = image && is_raw_path(image);
   const char *cfg = effective_cfg(raw ? g_conf.cfg_raw : g_conf.cfg);   // route around bypassed modules
+  if(g_cfg_overflow) { lg("err", "effective_cfg overflowed scratch buffer — rejecting rebuild"); return 1; }
   const char *inmod = raw ? "i-raw" : "i-jpg";
   char proxypath[1024] = "", abspath[1024]; const char *use_image = image;
   if(image && !raw)
