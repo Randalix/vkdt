@@ -615,18 +615,21 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       // never bypass input/output/display modules — routing those out has no valid splice
       if(!strncmp(bn, "i-", 2) || !strncmp(bn, "o-", 2) || !strncmp(bn, "display", 7))
       { lg("err", "refusing to bypass %s", bn); return 1; }
-      // snapshot for rollback if the rebuild fails (don't leave a stuck broken session)
+      // snapshot + mutate + rebuild in one lock scope: effective_cfg reads these arrays under
+      // g_lock; mutating them outside g_lock would race with a concurrent open_image call.
+      pthread_mutex_lock(&g_lock);
       char save[16][48]; int savecnt = g_bypass_cnt; memcpy(save, g_bypass, sizeof(save));
       int idx = -1; for(int i = 0; i < g_bypass_cnt; i++) if(!strcmp(g_bypass[i], bn)) idx = i;
       if(on && idx < 0 && g_bypass_cnt < 16) snprintf(g_bypass[g_bypass_cnt++], 48, "%s", bn);
       else if(!on && idx >= 0) { g_bypass[idx][0] = 0; for(int i = idx; i < g_bypass_cnt - 1; i++) memcpy(g_bypass[i], g_bypass[i+1], 48); g_bypass_cnt--; }
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { // revert the bypass set and rebuild the last good graph
         lg("err", "bypass rebuild failed for %s — reverting", bn);
         memcpy(g_bypass, save, sizeof(save)); g_bypass_cnt = savecnt;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+        open_image(g_cur_image[0] ? g_cur_image : NULL);
       }
+      pthread_mutex_unlock(&g_lock);
       lg("srv", "bypass %s = %d (%d total)", bn, on, g_bypass_cnt);
       after_graph_change(c); send_graph(c);
       return 1;
@@ -638,26 +641,27 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       if(!is_addable(nm)) { lg("err", "addmod: unknown/non-chain module %s", nm); return 1; }
       // require that `after` exists and its output feeds at least one consumer — else the new
       // module would be an orphan (no edge to splice into).
+      // hold g_lock from validation through mutation + rebuild (see bypass handler for rationale)
       pthread_mutex_lock(&g_lock);
       int mi = find_modid(af), consumers = 0;
       if(mi >= 0) { int mo[16], co[16]; consumers = dt_module_get_module_after(&g_graph, g_graph.module + mi, mo, co, 16); }
-      pthread_mutex_unlock(&g_lock);
-      if(consumers <= 0) { lg("err", "addmod: %s has no output consumer to splice into", af); return 1; }
-      if(g_insert_cnt >= 16) { lg("err", "addmod: insert limit reached"); return 1; }
+      if(consumers <= 0) { pthread_mutex_unlock(&g_lock); lg("err", "addmod: %s has no output consumer to splice into", af); return 1; }
+      if(g_insert_cnt >= 16) { pthread_mutex_unlock(&g_lock); lg("err", "addmod: insert limit reached"); return 1; }
       char inst[16]; gen_inst(nm, inst, sizeof(inst));
       int idx = g_insert_cnt;
       snprintf(g_insert[idx].mod,   sizeof(g_insert[idx].mod),   "%s", nm);
       snprintf(g_insert[idx].inst,  sizeof(g_insert[idx].inst),  "%s", inst);
       snprintf(g_insert[idx].after, sizeof(g_insert[idx].after), "%s", af);
       g_insert_cnt++;
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { // incompatible connectors / bad splice -> revert and rebuild the last good graph
         lg("err", "addmod rebuild failed for %s after %s — reverting", nm, af);
         g_insert_cnt--;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+        open_image(g_cur_image[0] ? g_cur_image : NULL);
       }
       else lg("srv", "addmod %s:%s after %s (%d total)", nm, inst, af, g_insert_cnt);
+      pthread_mutex_unlock(&g_lock);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -665,18 +669,20 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   { char ni[48];   // rmmod <name:inst> : remove a user-added (inserted) module (template modules use bypass instead)
     if(sscanf(tmp, "rmmod %47s", ni) == 1)
     {
-      if(!is_inserted(ni)) { lg("err", "rmmod: %s is not a user-added module", ni); return 1; }
+      pthread_mutex_lock(&g_lock);   // hold through mutation + rebuild (see bypass handler)
+      if(!is_inserted(ni)) { pthread_mutex_unlock(&g_lock); lg("err", "rmmod: %s is not a user-added module", ni); return 1; }
       struct { char mod[40]; char inst[16]; char after[48]; } save[16]; int savecnt = g_insert_cnt;
       memcpy(save, g_insert, sizeof(save));
       for(int i = 0; i < g_insert_cnt; i++)
       { char k[64]; snprintf(k, sizeof(k), "%s:%s", g_insert[i].mod, g_insert[i].inst);
         if(!strcmp(k, ni)) { for(int j = i; j < g_insert_cnt - 1; j++) g_insert[j] = g_insert[j+1]; g_insert_cnt--; break; } }
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { lg("err", "rmmod rebuild failed for %s — reverting", ni);
         memcpy(g_insert, save, sizeof(save)); g_insert_cnt = savecnt;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
+        open_image(g_cur_image[0] ? g_cur_image : NULL); }
       else lg("srv", "rmmod %s (%d total)", ni, g_insert_cnt);
+      pthread_mutex_unlock(&g_lock);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -688,18 +694,20 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       { lg("err", "refusing preset name %s", pn); return 1; }
       char pp[256]; snprintf(pp, sizeof(pp), "presets/%s.pst", pn);
       if(access(pp, R_OK) != 0) { lg("err", "preset not found: %s", pp); return 1; }
+      pthread_mutex_lock(&g_lock);   // hold through mutation + rebuild (see bypass handler)
       for(int i = 0; i < g_preset_cnt; i++) if(!strcmp(g_preset[i], pn))   // idempotent: already applied
-      { lg("srv", "preset %s already applied", pn); send_graph(c); return 1; }
-      if(g_preset_cnt >= 16) { lg("err", "preset limit reached"); return 1; }
+      { pthread_mutex_unlock(&g_lock); lg("srv", "preset %s already applied", pn); send_graph(c); return 1; }
+      if(g_preset_cnt >= 16) { pthread_mutex_unlock(&g_lock); lg("err", "preset limit reached"); return 1; }
       snprintf(g_preset[g_preset_cnt++], 64, "%s", pn);
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { // bad preset (incompatible modules/connectors) -> revert and rebuild the last good graph
         lg("err", "preset rebuild failed for %s — reverting", pn);
         g_preset_cnt--;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+        open_image(g_cur_image[0] ? g_cur_image : NULL);
       }
       else lg("srv", "preset %s applied (%d total)", pn, g_preset_cnt);
+      pthread_mutex_unlock(&g_lock);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -707,17 +715,19 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   { char pn[64];   // unpreset <name> : remove a previously applied preset and rebuild
     if(sscanf(tmp, "unpreset %63s", pn) == 1)
     {
+      pthread_mutex_lock(&g_lock);   // hold through mutation + rebuild (see bypass handler)
       int idx = -1; for(int i = 0; i < g_preset_cnt; i++) if(!strcmp(g_preset[i], pn)) idx = i;
-      if(idx < 0) { lg("err", "unpreset: %s not applied", pn); return 1; }
+      if(idx < 0) { pthread_mutex_unlock(&g_lock); lg("err", "unpreset: %s not applied", pn); return 1; }
       char save[16][64]; int savecnt = g_preset_cnt; memcpy(save, g_preset, sizeof(save));
       for(int i = idx; i < g_preset_cnt - 1; i++) memcpy(g_preset[i], g_preset[i+1], 64);
       g_preset_cnt--;
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { lg("err", "unpreset rebuild failed for %s — reverting", pn);
         memcpy(g_preset, save, sizeof(save)); g_preset_cnt = savecnt;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
+        open_image(g_cur_image[0] ? g_cur_image : NULL); }
       else lg("srv", "unpreset %s (%d total)", pn, g_preset_cnt);
+      pthread_mutex_unlock(&g_lock);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -748,23 +758,25 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
               dt_token_str(mf->name), dt_token_str(mf->inst), dt_token_str(mf->connector[fc].name));
         }
       }
-      pthread_mutex_unlock(&g_lock);
-      if(!ok) { lg("err", "rewire %d <- %d rejected (bad id / no connector / cycle)", tm, fm); send_graph(c); return 1; }
+      // keep g_lock held through mutation + rebuild (see bypass handler for rationale);
+      // the validation above already holds the lock, so we continue without releasing.
+      if(!ok) { pthread_mutex_unlock(&g_lock); lg("err", "rewire %d <- %d rejected (bad id / no connector / cycle)", tm, fm); send_graph(c); return 1; }
       // snapshot for rollback; dedupe by `to` (an input has exactly one source) — last wins
       rb_rewire_t save[16]; int savecnt = g_rewire_cnt; memcpy(save, g_rewire, sizeof(save));
       int idx = -1; for(int i = 0; i < g_rewire_cnt; i++) if(!strcmp(g_rewire[i].to, tokey)) idx = i;
       if(idx < 0 && g_rewire_cnt < 16) idx = g_rewire_cnt++;
-      if(idx < 0) { lg("err", "rewire: limit reached"); send_graph(c); return 1; }
+      if(idx < 0) { pthread_mutex_unlock(&g_lock); lg("err", "rewire: limit reached"); send_graph(c); return 1; }
       snprintf(g_rewire[idx].to, sizeof(g_rewire[idx].to), "%s", tokey);
       snprintf(g_rewire[idx].from, sizeof(g_rewire[idx].from), "%s", fromval);
-      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      int err = open_image(g_cur_image[0] ? g_cur_image : NULL);
       if(err)
       { // incompatible connectors / bad rewrite -> revert and rebuild the last good graph
         lg("err", "rewire rebuild failed (%s <- %s) — reverting", tokey, fromval);
         memcpy(g_rewire, save, sizeof(save)); g_rewire_cnt = savecnt;
-        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+        open_image(g_cur_image[0] ? g_cur_image : NULL);
       }
       else lg("srv", "rewire %s <- %s (%d total)", tokey, fromval, g_rewire_cnt);
+      pthread_mutex_unlock(&g_lock);
       after_graph_change(c); send_graph(c);
       return 1;
     }
