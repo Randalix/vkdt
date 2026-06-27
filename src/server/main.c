@@ -263,6 +263,11 @@ static void build_menu_json(void)
     if(!so) continue;
     const char *nm = dt_token_str(g_graph.module[m].name);
     if(nm[0] && nm[1]=='-' && (nm[0]=='i' || nm[0]=='o')) continue; // skip input/output modules
+    // crop:rot is the rotation-only stage (applies EXIF orientation, centred) that precedes the
+    // user crop:01. it must not be user-editable: an off-centre crop combined with rotation breaks
+    // (the shader rotates about the image centre), so rotation lives alone here and the user crops
+    // the already-upright image in crop:01. hide it from the menu.
+    if(g_graph.module[m].name == dt_token("crop") && g_graph.module[m].inst == dt_token("rot")) continue;
     int has = 0;
     for(int pi = 0; pi < so->num_params; pi++) if(is_editable(so->param[pi])) { has = 1; break; }
     if(!has) continue;
