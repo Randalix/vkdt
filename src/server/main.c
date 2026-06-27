@@ -324,6 +324,33 @@ static void build_menu_json(void)
       else o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
           pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
     }
+    // curves: the control-point arrays are 'hidden' (driven by the GUI's spline widget). Emit a
+    // synthetic "curve" item bundling the luminance tone curve (xr/yr/cntr) + the parids the web
+    // client needs, so it can render a 2D spline editor. commit_params recomputes the spline.
+    if(!strcmp(dt_token_str(g_graph.module[m].name), "curves"))
+    {
+      dt_module_so_t *cso = g_graph.module[m].so;
+      const int pm = dt_module_get_param(cso, dt_token("mode")), pc = dt_module_get_param(cso, dt_token("channel"));
+      const int pn = dt_module_get_param(cso, dt_token("cntr"));
+      const int px = dt_module_get_param(cso, dt_token("xr")), py = dt_module_get_param(cso, dt_token("yr"));
+      if(px >= 0 && py >= 0 && pn >= 0)
+      {
+        uint8_t *base = (uint8_t *)g_graph.module[m].param;
+        const int cnt  = *(const int *)(base + cso->param[pn]->offset);
+        const int mode = pm >= 0 ? *(const int *)(base + cso->param[pm]->offset) : 0;
+        const float *xv = (const float *)(base + cso->param[px]->offset);
+        const float *yv = (const float *)(base + cso->param[py]->offset);
+        if(!firstit) o += snprintf(o, e-o, ",");
+        firstit = 0;
+        o += snprintf(o, e-o, "{\"label\":\"curve\",\"kind\":\"curve\",\"mode_parid\":%d,\"channel_parid\":%d,"
+            "\"cnt_parid\":%d,\"x_parid\":%d,\"y_parid\":%d,\"maxpts\":%d,\"mode\":%d,\"cnt\":%d,\"x\":[",
+            pm, pc, pn, px, py, cso->param[px]->cnt, mode, cnt);
+        for(int k = 0; k < cso->param[px]->cnt; k++) o += snprintf(o, e-o, "%s%g", k ? "," : "", xv[k]);
+        o += snprintf(o, e-o, "],\"y\":[");
+        for(int k = 0; k < cso->param[py]->cnt; k++) o += snprintf(o, e-o, "%s%g", k ? "," : "", yv[k]);
+        o += snprintf(o, e-o, "]}");
+      }
+    }
     o += snprintf(o, e-o, "]}");
   }
   o += snprintf(o, e-o, "],\"presets\":[");
