@@ -55,6 +55,11 @@ static int             g_insert_cnt = 0;
 // resolved ("name:inst:conn") so they survive graph rebuilds (modids aren't stable, tokens are).
 static rb_rewire_t     g_rewire[16];
 static int             g_rewire_cnt = 0;
+// applied presets: each is a built-in `.pst` file name (no path, no extension). its raw cfg lines
+// are appended to the effective cfg on every rebuild, so the preset survives bypass/insert/rewire
+// reloads — the same model vkdt's GUI uses (load graph, then apply preset lines onto it).
+static char            g_preset[16][64];
+static int             g_preset_cnt = 0;
 static volatile int    g_stop = 0;
 static char            g_menu_json[65536];
 static char            g_recipe_path[1024];   // server-authoritative recipe (vkdt .cfg sidecar)
@@ -384,6 +389,8 @@ static void send_graph(struct mg_connection *c)
   for(int i = 0; i < g_bypass_cnt; i++) o += snprintf(o, e-o, "%s\"%s\"", i ? "," : "", g_bypass[i]);
   o += snprintf(o, e-o, "],\"inserted\":[");   // user-added modules ("name:inst") so the client can mark + remove them
   for(int i = 0; i < g_insert_cnt; i++) o += snprintf(o, e-o, "%s\"%s:%s\"", i ? "," : "", g_insert[i].mod, g_insert[i].inst);
+  o += snprintf(o, e-o, "],\"presets_on\":[");   // applied presets (file names) so the client can mark active + un-apply
+  for(int i = 0; i < g_preset_cnt; i++) o += snprintf(o, e-o, "%s\"%s\"", i ? "," : "", g_preset[i]);
   o += snprintf(o, e-o, "]}");
   pthread_mutex_unlock(&g_lock);
   mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, buf, o-buf);
@@ -614,6 +621,47 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
         memcpy(g_insert, save, sizeof(save)); g_insert_cnt = savecnt;
         pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
       else lg("srv", "rmmod %s (%d total)", ni, g_insert_cnt);
+      after_graph_change(c); send_graph(c);
+      return 1;
+    }
+  }
+  { char pn[64];   // preset <name> : apply a built-in preset (append its .pst to the cfg overlay, rebuild)
+    if(sscanf(tmp, "preset %63s", pn) == 1)
+    {
+      if(strstr(pn, "..") || strchr(pn, '/') || strchr(pn, '\\'))
+      { lg("err", "refusing preset name %s", pn); return 1; }
+      char pp[256]; snprintf(pp, sizeof(pp), "presets/%s.pst", pn);
+      if(access(pp, R_OK) != 0) { lg("err", "preset not found: %s", pp); return 1; }
+      for(int i = 0; i < g_preset_cnt; i++) if(!strcmp(g_preset[i], pn))   // idempotent: already applied
+      { lg("srv", "preset %s already applied", pn); send_graph(c); return 1; }
+      if(g_preset_cnt >= 16) { lg("err", "preset limit reached"); return 1; }
+      snprintf(g_preset[g_preset_cnt++], 64, "%s", pn);
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err)
+      { // bad preset (incompatible modules/connectors) -> revert and rebuild the last good graph
+        lg("err", "preset rebuild failed for %s — reverting", pn);
+        g_preset_cnt--;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      }
+      else lg("srv", "preset %s applied (%d total)", pn, g_preset_cnt);
+      after_graph_change(c); send_graph(c);
+      return 1;
+    }
+  }
+  { char pn[64];   // unpreset <name> : remove a previously applied preset and rebuild
+    if(sscanf(tmp, "unpreset %63s", pn) == 1)
+    {
+      int idx = -1; for(int i = 0; i < g_preset_cnt; i++) if(!strcmp(g_preset[i], pn)) idx = i;
+      if(idx < 0) { lg("err", "unpreset: %s not applied", pn); return 1; }
+      char save[16][64]; int savecnt = g_preset_cnt; memcpy(save, g_preset, sizeof(save));
+      for(int i = idx; i < g_preset_cnt - 1; i++) memcpy(g_preset[i], g_preset[i+1], 64);
+      g_preset_cnt--;
+      pthread_mutex_lock(&g_lock); int err = open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock);
+      if(err)
+      { lg("err", "unpreset rebuild failed for %s — reverting", pn);
+        memcpy(g_preset, save, sizeof(save)); g_preset_cnt = savecnt;
+        pthread_mutex_lock(&g_lock); open_image(g_cur_image[0] ? g_cur_image : NULL); pthread_mutex_unlock(&g_lock); }
+      else lg("srv", "unpreset %s (%d total)", pn, g_preset_cnt);
       after_graph_change(c); send_graph(c);
       return 1;
     }
@@ -941,7 +989,7 @@ static int g_cfg_overflow;   // set by effective_cfg if the rewrite truncated; o
 static const char *effective_cfg(const char *base)
 {
   g_cfg_overflow = 0;
-  if(g_bypass_cnt <= 0 && g_insert_cnt <= 0 && g_rewire_cnt <= 0) return base;
+  if(g_bypass_cnt <= 0 && g_insert_cnt <= 0 && g_rewire_cnt <= 0 && g_preset_cnt <= 0) return base;
   FILE *f = fopen(base, "rb"); if(!f) return base;
   static char buf[65536]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[n] = 0;
   // rewire pass FIRST: edits the base connect lines (repoint inputs) before bypass/insert run on top
@@ -1015,6 +1063,25 @@ static const char *effective_cfg(const char *base)
 
   if(o >= e) g_cfg_overflow = 1;   // bypass pass truncated the cfg -> caller must reject
   if(g_insert_cnt > 0 && apply_inserts(out, sizeof(out))) g_cfg_overflow = 1;
+
+  // append each applied preset's raw .pst lines onto the (possibly rewritten) cfg. reading the
+  // combined file is equivalent to building the base graph and then applying the preset lines —
+  // exactly what the vkdt GUI does. modules/connects/params resolve in order; a later connect on
+  // an input replaces the earlier one, and connect:-1:-1:-1:... disconnects.
+  for(int i = 0; i < g_preset_cnt; i++)
+  {
+    char pp[256]; snprintf(pp, sizeof(pp), "presets/%s.pst", g_preset[i]);
+    FILE *pf = fopen(pp, "rb");
+    if(!pf) { lg("err", "preset file missing on rebuild: %s", pp); g_cfg_overflow = 1; continue; }
+    size_t ol = strlen(out);
+    if(ol + 2 < sizeof(out)) { out[ol++] = '\n'; out[ol] = 0; }   // ensure the append starts on a fresh line
+    size_t rd = fread(out + ol, 1, sizeof(out) - 1 - ol, pf);
+    out[ol + rd] = 0;
+    // truncation check: if a byte still remains in the file, the append didn't fit. (feof alone
+    // false-positives on an exact fit — fread stops on the byte count, not EOF, leaving feof unset.)
+    if(fgetc(pf) != EOF) g_cfg_overflow = 1;
+    fclose(pf);
+  }
 
   const char *path = "rabbit_eff.cfg";
   FILE *w = fopen(path, "wb"); if(!w) return base;
