@@ -813,6 +813,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   {
     pthread_mutex_lock(&g_lock);
     dt_module_t *m = g_graph.module + modid;
+    if(parid < 0 || parid >= m->so->num_params) { pthread_mutex_unlock(&g_lock); return 1; }  // reject bad parid (e.g. stale modid after a rebuild) — never index out of the param array
     const dt_ui_param_t *p = m->so->param[parid];
     float *val = (float *)((uint8_t *)m->param + p->offset);
     float old = *val; *val = v;
@@ -841,6 +842,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   {
     pthread_mutex_lock(&g_lock);
     dt_module_t *m = g_graph.module + modid;
+    if(parid < 0 || parid >= m->so->num_params) { pthread_mutex_unlock(&g_lock); return 1; }  // reject bad parid
     const dt_ui_param_t *p = m->so->param[parid];
     float *val = (float *)((uint8_t *)m->param + p->offset);
     float old0 = val[0];
@@ -868,6 +870,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     {
       pthread_mutex_lock(&g_lock);
       dt_module_t *m = g_graph.module + im;
+      if(ip < 0 || ip >= m->so->num_params) { pthread_mutex_unlock(&g_lock); return 1; }  // reject bad parid
       const dt_ui_param_t *p = m->so->param[ip];
       int *val = (int *)((uint8_t *)m->param + p->offset);
       int old = *val; *val = iv;
@@ -892,6 +895,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     {
       pthread_mutex_lock(&g_lock);
       dt_module_t *m = g_graph.module + cm;
+      if(cp < 0 || cp >= m->so->num_params) { pthread_mutex_unlock(&g_lock); return 1; }  // reject bad parid
       const dt_ui_param_t *p = m->so->param[cp];
       if(ci >= 0 && ci < p->cnt)
       {
