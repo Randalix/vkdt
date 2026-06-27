@@ -1178,6 +1178,26 @@ static int open_image(const char *image)
       }
     }
   }
+  // re-apply active presets' param lines AFTER the recipe, so a preset's params win over the
+  // image's stored values. the recipe (above) writes every param incl. defaults, so a param-only
+  // preset would otherwise be silently clobbered (e.g. exposure preset overridden by exposure:0).
+  // module/connect lines are already baked into the effective cfg -> only param: lines here.
+  for(int i = 0; i < g_preset_cnt; i++)
+  {
+    char pp[256]; snprintf(pp, sizeof(pp), "presets/%s.pst", g_preset[i]);
+    FILE *pf = fopen(pp, "r"); if(!pf) continue;
+    char line[4096]; int papplied = 0;
+    while(fgets(line, sizeof(line), pf))
+    {
+      line[strcspn(line, "\r\n")] = 0;
+      if(strncmp(line, "param:", 6)) continue;
+      if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12)) continue;  // server-managed input
+      if(dt_graph_read_config_line(&g_graph, line) == 0) papplied++;
+    }
+    fclose(pf);
+    if(papplied) { size_t n = 0; double ms = 0; unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all); free(b); }
+    lg("srv", "preset %s re-applied over recipe: %d params", g_preset[i], papplied);
+  }
   dt_graph_history_init(&g_graph);
   dt_graph_history_reset(&g_graph);
   g_history_base = g_graph.history_item_end;
