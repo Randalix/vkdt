@@ -152,7 +152,15 @@ static inline int is_combo(const dt_ui_param_t *p)
 {
   return p->widget.type == dt_token("combo") && p->type == dt_token("int") && p->cnt == 1 && p->widget.data;
 }
-static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p) || is_crop(p) || is_straight(p) || is_combo(p); }
+static inline int is_zones(const dt_ui_param_t *p)
+{ // multi-value float slider (e.g. zones' per-zone exposure array) -> a stack of sliders
+  return p->widget.type == dt_token("slider") && p->type == dt_token("float") && p->cnt > 1;
+}
+static inline int is_int_slider(const dt_ui_param_t *p)
+{ // single int slider (e.g. zones' nzones count) -> set via the I command
+  return p->widget.type == dt_token("slider") && p->type == dt_token("int") && p->cnt == 1;
+}
+static inline int is_editable(const dt_ui_param_t *p){ return is_radial_slider(p) || is_wheel(p) || is_crop(p) || is_straight(p) || is_combo(p) || is_zones(p) || is_int_slider(p); }
 
 static inline float param_get(int modid, int parid)
 {
@@ -297,6 +305,20 @@ static void build_menu_json(void)
         const char *opt = (const char *)p->widget.data; int firsto = 1;
         while(*opt) { o += snprintf(o, e-o, "%s\"%s\"", firsto ? "" : ",", opt); firsto = 0; opt += strlen(opt) + 1; }
         o += snprintf(o, e-o, "]}");
+      }
+      else if(is_zones(p))
+      { // multi-value float slider: emit the whole array; client renders one slider per element
+        const float *c = (const float *)((uint8_t *)g_graph.module[m].param + p->offset);
+        o += snprintf(o, e-o, "\",\"kind\":\"zones\",\"parid\":%d,\"min\":%g,\"max\":%g,\"cnt\":%d,\"cur\":[",
+            pi, p->widget.min, p->widget.max, p->cnt);
+        for(int k = 0; k < p->cnt; k++) o += snprintf(o, e-o, "%s%g", k ? "," : "", c[k]);
+        o += snprintf(o, e-o, "]}");
+      }
+      else if(is_int_slider(p))
+      { // single int slider (e.g. nzones) -> client sets it via the I command
+        const int cur = *(const int *)((uint8_t *)g_graph.module[m].param + p->offset);
+        o += snprintf(o, e-o, "\",\"kind\":\"islider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%d}",
+            pi, p->widget.min, p->widget.max, p->val[0], cur);
       }
       else o += snprintf(o, e-o, "\",\"kind\":\"slider\",\"parid\":%d,\"min\":%g,\"max\":%g,\"def\":%g,\"cur\":%g}",
           pi, p->widget.min, p->widget.max, p->val[0], param_get(m, pi));
@@ -830,6 +852,34 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       if(b) { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n); free(b);
               fprintf(stderr, "[srv] setint %d:%d = %d  render %.1f ms  %zu B\n", im, ip, iv, ms, n); }
       g_dirty = 1;
+      return 1;
+    }
+  }
+
+  // component set: one element of a multi-value float param (e.g. zones' zone[i]):
+  // "C <modid> <parid> <idx> <v>"
+  { int cm, cp, ci; float cv;
+    if(sscanf(tmp, "C %d %d %d %f", &cm, &cp, &ci, &cv) == 4 && cm >= 0 && cm < g_graph.num_modules)
+    {
+      pthread_mutex_lock(&g_lock);
+      dt_module_t *m = g_graph.module + cm;
+      const dt_ui_param_t *p = m->so->param[cp];
+      if(ci >= 0 && ci < p->cnt)
+      {
+        float *val = (float *)((uint8_t *)m->param + p->offset);
+        float old = val[ci]; val[ci] = cv;
+        dt_graph_run_t fl = s_graph_run_none;
+        if(m->so->check_params) fl = m->so->check_params(m, cp, 0, &old);
+        g_graph.active_module = cm;
+        dt_graph_history_append(&g_graph, cm, cp, 2.0);
+        size_t n = 0; double ms = 0;
+        unsigned char *b = render_to_jpeg(&n, &ms, fl);
+        pthread_mutex_unlock(&g_lock);
+        if(b) { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n); free(b);
+                fprintf(stderr, "[srv] setcomp %d:%d[%d] = %g  render %.1f ms  %zu B\n", cm, cp, ci, cv, ms, n); }
+        g_dirty = 1;
+      }
+      else pthread_mutex_unlock(&g_lock);
       return 1;
     }
   }
