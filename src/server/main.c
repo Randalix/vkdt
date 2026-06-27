@@ -88,6 +88,7 @@ static int is_raw_path(const char *p)
 static void recipe_save(void);
 static int  open_image(const char *image);    // (re)build the warm graph for an image
 static int  is_inserted(const char *ni);      // is "name:inst" a user-added (spliced-in) module?
+static void restore_overlays_from_sidecar(const char *image);  // bring back insert/rewire/preset on image switch
 
 // timestamped log to stderr + the configured logfile. tag groups the source (srv/cli/err).
 static void lg(const char *tag, const char *fmt, ...)
@@ -546,6 +547,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
       lg("srv", "open %s", path);
       pthread_mutex_lock(&g_lock);
+      restore_overlays_from_sidecar(path);   // bring back this image's addmod/rewire/preset overlays
       int err = open_image(path);
       pthread_mutex_unlock(&g_lock);
       if(err) lg("err", "open failed: %s", path);
@@ -1139,6 +1141,41 @@ static const char *effective_cfg(const char *base)
   return path;
 }
 
+// repopulate the insert/rewire/preset overlays from the image's recipe sidecar (#rb-* lines) so
+// addmod/rewire/preset modules survive a SERVER RESTART (the sidecar's module/connect lines are
+// ignored by the param-only restore; effective_cfg rebuilds them from these arrays). Call only on
+// an image SWITCH (the `open` command / startup) — NOT on same-image rebuilds, which already carry
+// the live overlays. Bypass is intentionally runtime-only (recipe stays at the full-graph state).
+static void restore_overlays_from_sidecar(const char *image)
+{
+  g_insert_cnt = g_rewire_cnt = g_preset_cnt = g_bypass_cnt = 0;
+  if(!image) return;
+  char path[1024]; snprintf(path, sizeof(path), "%s.cfg", image);
+  FILE *f = fopen(path, "r"); if(!f) return;
+  char line[1024];
+  while(fgets(line, sizeof(line), f))
+  {
+    line[strcspn(line, "\r\n")] = 0;
+    if(!strncmp(line, "#rb-insert:", 11) && g_insert_cnt < 16)
+    { char m[40], in[16], af[48];   // #rb-insert:<mod>:<inst>:<after(name:inst)>
+      if(sscanf(line + 11, "%39[^:]:%15[^:]:%47[^\n]", m, in, af) == 3)
+      { snprintf(g_insert[g_insert_cnt].mod, 40, "%s", m);
+        snprintf(g_insert[g_insert_cnt].inst, 16, "%s", in);
+        snprintf(g_insert[g_insert_cnt].after, 48, "%s", af); g_insert_cnt++; } }
+    else if(!strncmp(line, "#rb-rewire:", 11) && g_rewire_cnt < 16)
+    { char to[64], fr[80];          // #rb-rewire:<to>|<from>  (each "name:inst:conn", so split on |)
+      if(sscanf(line + 11, "%63[^|]|%79[^\n]", to, fr) == 2)
+      { snprintf(g_rewire[g_rewire_cnt].to, 64, "%s", to);
+        snprintf(g_rewire[g_rewire_cnt].from, 80, "%s", fr); g_rewire_cnt++; } }
+    else if(!strncmp(line, "#rb-preset:", 11) && g_preset_cnt < 16)
+      snprintf(g_preset[g_preset_cnt++], 64, "%s", line + 11);
+  }
+  fclose(f);
+  if(g_insert_cnt || g_rewire_cnt || g_preset_cnt)
+    lg("srv", "overlays restored from sidecar: %d insert, %d rewire, %d preset",
+        g_insert_cnt, g_rewire_cnt, g_preset_cnt);
+}
+
 static int open_image(const char *image)
 {
   // pick pipeline + input by file type: raw -> i-raw graph, fed the ORIGINAL file (vkdt
@@ -1252,6 +1289,19 @@ static void recipe_save(void)
   pthread_mutex_lock(&g_lock);
   int err = dt_graph_write_config_ascii(&g_graph, g_recipe_path);
   pthread_mutex_unlock(&g_lock);
+  if(!err)
+  { // persist the insert/rewire/preset overlays as #rb-* comments (vkdt ignores #). The sidecar's
+    // module/connect lines alone don't restore — restore_overlays_from_sidecar re-reads these so the
+    // overlays come back on the next `open`, surviving a server restart.
+    FILE *ov = fopen(g_recipe_path, "a");
+    if(ov)
+    {
+      for(int i = 0; i < g_insert_cnt; i++) fprintf(ov, "#rb-insert:%s:%s:%s\n", g_insert[i].mod, g_insert[i].inst, g_insert[i].after);
+      for(int i = 0; i < g_rewire_cnt; i++) fprintf(ov, "#rb-rewire:%s|%s\n", g_rewire[i].to, g_rewire[i].from);
+      for(int i = 0; i < g_preset_cnt; i++) fprintf(ov, "#rb-preset:%s\n", g_preset[i]);
+      fclose(ov);
+    }
+  }
   lg(err ? "err" : "srv", "recipe %s -> %s", err ? "WRITE FAILED" : "saved", g_recipe_path);
 }
 // debounced autosave: write at most every ~2s while there are pending edits.
@@ -1408,6 +1458,7 @@ int main(int argc, char *argv[])
 
   mkdir(g_conf.libdir, 0755);            // library / upload directory (relative to cwd)
   const char *image = g_conf.image[0] ? g_conf.image : NULL;
+  restore_overlays_from_sidecar(image);   // restart-persistence: bring back inserted modules
   if(open_image(image)) { lg("err", "initial open failed"); return 1; }
   lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s  preview=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile, g_conf.preview_webp ? "webp" : "jpeg");
 
