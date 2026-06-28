@@ -70,10 +70,10 @@ static FILE           *g_logf = NULL;         // optional logfile (config: logfi
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
-  char port[16], docroot[512], cfg[512], cfg_raw[512], image[1024], libdir[512], logfile[512];
+  char port[16], docroot[512], cfg[512], cfg_raw[512], cfg_vid[512], image[1024], libdir[512], logfile[512];
   int  proxy_max, preview_max, quality;
   int  preview_webp;   // 1 = stream webp preview frames (o-webp) instead of jpeg (o-jpg)
-} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90, 0 };
+} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "examples/m3_vid.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90, 0 };
 
 // raw photo extensions -> use the i-raw pipeline (no jpeg proxy; vkdt decodes the raw)
 static int is_raw_path(const char *p)
@@ -82,6 +82,16 @@ static int is_raw_path(const char *p)
   char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
   static const char *raw[] = { "dng","cr2","cr3","nef","arw","raf","rw2","orf","pef","srw","raw","3fr","iiq","nrw","mrw", NULL };
   for(int k = 0; raw[k]; k++) if(!strcmp(e, raw[k])) return 1;
+  return 0;
+}
+
+// video extensions -> use the i-vid pipeline (ffmpeg-decoded, no proxy; frame set via g_graph.frame)
+static int is_vid_path(const char *p)
+{
+  const char *dot = strrchr(p, '.'); if(!dot) return 0;
+  char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
+  static const char *vid[] = { "mp4","mkv","mov","avi","webm","m4v", NULL };
+  for(int k = 0; vid[k]; k++) if(!strcmp(e, vid[k])) return 1;
   return 0;
 }
 
@@ -116,6 +126,7 @@ static void load_config(const char *path)
     else if(!strcmp(k,"docroot"))     snprintf(g_conf.docroot, sizeof(g_conf.docroot), "%s", v);
     else if(!strcmp(k,"cfg"))         snprintf(g_conf.cfg,     sizeof(g_conf.cfg),     "%s", v);
     else if(!strcmp(k,"cfg_raw"))     snprintf(g_conf.cfg_raw, sizeof(g_conf.cfg_raw), "%s", v);
+    else if(!strcmp(k,"cfg_vid"))     snprintf(g_conf.cfg_vid, sizeof(g_conf.cfg_vid), "%s", v);
     else if(!strcmp(k,"image"))       snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", v);
     else if(!strcmp(k,"libdir"))      snprintf(g_conf.libdir,  sizeof(g_conf.libdir),  "%s", v);
     else if(!strcmp(k,"logfile"))     snprintf(g_conf.logfile, sizeof(g_conf.logfile), "%s", v);
@@ -377,7 +388,15 @@ static void build_menu_json(void)
     }
     fclose(f);
   }
-  o += snprintf(o, e-o, "]}");
+  o += snprintf(o, e-o, "]");
+  // video block: present when i-vid is in the graph so the client shows the timeline
+  int is_vid_graph = 0;
+  for(int m = 0; m < g_graph.num_modules && !is_vid_graph; m++)
+    if(g_graph.module[m].so && g_graph.module[m].name == dt_token("i-vid")) is_vid_graph = 1;
+  if(is_vid_graph)
+    o += snprintf(o, e-o, ",\"video\":{\"total_frames\":%d,\"fps\":%g,\"current_frame\":%d}",
+        g_graph.frame_cnt, g_graph.frame_rate, g_graph.frame);
+  o += snprintf(o, e-o, "}");
 }
 
 // send the user-facing history stack (edits after the baseline snapshot) as JSON.
@@ -592,6 +611,81 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
   if(!strncmp(tmp, "hist", 4)) { send_history(c); return 1; }
   if(!strncmp(tmp, "graph", 5)) { send_graph(c); return 1; }
   if(!strncmp(tmp, "mods", 4))  { send_mods(c);  return 1; }   // catalog of addable modules
+  { int fn;   // seek <frame> : jump to a specific frame in a video (sets g_graph.frame, re-renders)
+    if(sscanf(tmp, "seek %d", &fn) == 1 && fn >= 0)
+    {
+      pthread_mutex_lock(&g_lock);
+      if(g_graph.frame_cnt > 0 && fn >= g_graph.frame_cnt) fn = g_graph.frame_cnt - 1;
+      g_graph.frame = fn;
+      size_t n = 0; double ms = 0;
+      unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all);
+      pthread_mutex_unlock(&g_lock);
+      if(b) { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_BINARY, (const char *)b, n); free(b); }
+      char sf[64]; snprintf(sf, sizeof(sf), "{\"type\":\"seek\",\"frame\":%d}", fn);
+      mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, sf, strlen(sf));
+      lg("srv", "seek %d  render %.1f ms  %zu B", fn, ms, n);
+      return 1;
+    }
+  }
+  if(!strncmp(tmp, "export_video", 12))
+  { // export_video [start] [end] : render video frames and encode to h265 via ffmpeg pipe
+    int start = 0, end = -1;
+    sscanf(tmp + 12, " %d %d", &start, &end);
+    pthread_mutex_lock(&g_lock);
+    int fc = g_graph.frame_cnt; float fps = (float)g_graph.frame_rate;
+    pthread_mutex_unlock(&g_lock);
+    if(fc <= 0 || fps <= 0)
+    { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, "{\"type\":\"export_error\",\"msg\":\"no video\"}", 40); return 1; }
+    if(end < 0 || end >= fc) end = fc - 1;
+    if(start < 0 || start >= fc) start = 0;
+    // detect hevc_nvenc once; fall back to libx265
+    static int has_nvenc = -1;
+    if(has_nvenc < 0) has_nvenc = (system("ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc") == 0);
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/export_%ld.mkv", g_conf.libdir, (long)time(NULL));
+    const char *icodec = g_conf.preview_webp ? "webp" : "mjpeg";
+    char ffcmd[1024];
+    if(has_nvenc)
+      snprintf(ffcmd, sizeof(ffcmd),
+          "ffmpeg -y -f image2pipe -vcodec %s -framerate %.3f -i pipe:0 "
+          "-vf unsharp=3:3:1.0 -c:v hevc_nvenc -preset p4 -cq 20 "
+          "-movflags +faststart \"%s\" 2>/dev/null", icodec, fps, outpath);
+    else
+      snprintf(ffcmd, sizeof(ffcmd),
+          "ffmpeg -y -f image2pipe -vcodec %s -framerate %.3f -i pipe:0 "
+          "-vf unsharp=3:3:1.0 -c:v libx265 -preset slow -crf 18 "
+          "-x265-params no-sao=1:psy-rdoq=2.00:aq-mode=3:deblock=-1,-1 "
+          "-movflags +faststart \"%s\" 2>/dev/null", icodec, fps, outpath);
+    FILE *fp = popen(ffcmd, "w");
+    if(!fp)
+    { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, "{\"type\":\"export_error\",\"msg\":\"ffmpeg failed\"}", 46); return 1; }
+    int total = end - start + 1;
+    for(int fn = start; fn <= end; fn++)
+    {
+      pthread_mutex_lock(&g_lock);
+      g_graph.frame = fn;
+      size_t n = 0; double ms = 0;
+      unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all);
+      pthread_mutex_unlock(&g_lock);
+      if(b) { fwrite(b, 1, n, fp); free(b); }
+      if((fn - start) % 10 == 0 || fn == end)
+      {
+        char prog[80];
+        snprintf(prog, sizeof(prog), "{\"type\":\"export_progress\",\"frame\":%d,\"total\":%d}", fn - start + 1, total);
+        mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, prog, strlen(prog));
+      }
+    }
+    int ret = pclose(fp);
+    char result[256];
+    if(ret == 0)
+    { const char *fn = strrchr(outpath, '/'); fn = fn ? fn+1 : outpath;
+      snprintf(result, sizeof(result), "{\"type\":\"export_done\",\"file\":\"%s\"}", fn); }
+    else
+      snprintf(result, sizeof(result), "{\"type\":\"export_error\",\"msg\":\"encode failed (ret=%d)\"}", ret);
+    mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, result, strlen(result));
+    lg("srv", "export_video %d..%d -> %s (ret=%d)", start, end, outpath, ret);
+    return 1;
+  }
   { int mi;   // fitcrop <modid> : auto-fit the crop to the rotated inscribed rect (vkdt's own geometry, item 32 v2)
     if(sscanf(tmp, "fitcrop %d", &mi) == 1 && mi >= 0 && mi < g_graph.num_modules)
     {
@@ -1226,27 +1320,28 @@ static void restore_overlays_from_sidecar(const char *image)
 
 static int open_image(const char *image)
 {
-  // pick pipeline + input by file type: raw -> i-raw graph, fed the ORIGINAL file (vkdt
-  // decodes/demosaics it; only the streamed preview is jpeg). jpeg -> i-jpg graph + a
-  // small preview proxy. The proxy/decode runs BEFORE the graph teardown, so a bad file
-  // leaves the current session intact.
+  // pick pipeline + input by file type: raw -> i-raw graph (no proxy); video -> i-vid graph
+  // (no proxy, frame index via g_graph.frame); jpeg -> i-jpg graph + small preview proxy.
+  // Proxy/decode runs BEFORE graph teardown so a bad file leaves the current session intact.
   const int raw = image && is_raw_path(image);
-  const char *cfg = effective_cfg(raw ? g_conf.cfg_raw : g_conf.cfg);   // route around bypassed modules
+  const int vid = image && is_vid_path(image);
+  const char *cfg = effective_cfg(vid ? g_conf.cfg_vid : (raw ? g_conf.cfg_raw : g_conf.cfg));
   if(g_cfg_overflow) { lg("err", "effective_cfg overflowed scratch buffer — rejecting rebuild"); return 1; }
-  const char *inmod = raw ? "i-raw" : "i-jpg";
+  const char *inmod = vid ? "i-vid" : (raw ? "i-raw" : "i-jpg");
   char proxypath[1024] = "", abspath[1024]; const char *use_image = image;
-  if(image && !raw)
+  if(image && !raw && !vid)
   {
     snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
     if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
     { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
     else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
   }
-  else if(raw)
-  { // i-raw needs a resolvable path: pass it absolute (modify_roi_out early-returns on an
-    // unresolvable filename -> the o-jpg sink gets an uninited size and export fails).
+  else if(raw || vid)
+  { // i-raw / i-vid need a resolvable path: pass absolute (modify_roi_out early-returns on
+    // an unresolvable filename -> the o-jpg sink gets an uninited size and export fails).
     if(realpath(image, abspath)) use_image = abspath;
-    lg("srv", "raw input <- %s", use_image);
+    lg("srv", "%s input <- %s", vid ? "vid" : "raw", use_image);
+    if(vid) g_graph.frame = 0;  // reset to first frame on new video open
   }
   // remember the ORIGINAL (absolute) image for full-res export
   if(image) { char a[1024]; snprintf(g_cur_image, sizeof(g_cur_image), "%s", realpath(image, a) ? a : image); }
@@ -1304,7 +1399,7 @@ static int open_image(const char *image)
         {
           line[strcspn(line, "\r\n")] = 0;
           if(strncmp(line, "param:", 6)) continue;
-          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12)) continue;  // server-managed input
+          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12) || !strncmp(line, "param:i-vid:", 12)) continue;  // server-managed input
           if(dt_graph_read_config_line(&g_graph, line) == 0) applied++;
         }
         fclose(rf);
@@ -1360,6 +1455,29 @@ static void *autosave_thread(void *u)
   return NULL;
 }
 
+// HTTP GET /dl/<filename> — serve a file from the library dir as a download.
+// Used by the client to download video exports produced by export_video.
+static int dl_handler(struct mg_connection *c, void *u)
+{
+  (void)u;
+  const struct mg_request_info *ri = mg_get_request_info(c);
+  const char *uri = ri->local_uri ? ri->local_uri : "";
+  const char *bn = uri + 4;   // skip "/dl/"
+  for(const char *p = bn; *p; p++) if(*p=='/' || *p=='\\') { bn = p+1; }  // basename only
+  if(!*bn || strstr(bn, "..")) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
+  char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
+  FILE *f = fopen(path, "rb"); if(!f) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
+  fseek(f, 0, SEEK_END); long fsz = ftell(f); rewind(f);
+  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/x-matroska\r\n"
+               "Content-Disposition: attachment; filename=\"%s\"\r\n"
+               "Content-Length: %ld\r\n\r\n", bn, fsz);
+  char buf[65536]; int n;
+  while((n = (int)fread(buf, 1, sizeof(buf), f)) > 0) mg_write(c, buf, (size_t)n);
+  fclose(f);
+  lg("srv", "dl %s (%ld B)", bn, fsz);
+  return 200;
+}
+
 // HTTP POST /upload?name=foo.jpg — save the raw body into the library dir; returns the
 // stored basename. The client then sends a WS `open <name>` to switch to it.
 static int upload_handler(struct mg_connection *c, void *u)
@@ -1402,10 +1520,11 @@ static int export_handler(struct mg_connection *c, void *u)
 
   pthread_mutex_lock(&g_lock);
   const int raw = is_raw_path(g_cur_image);
+  const int vid = is_vid_path(g_cur_image);
   dt_graph_t ex; dt_graph_init(&ex, s_queue_compute);
   snprintf(ex.searchpath, sizeof(ex.searchpath), ".");
   dt_graph_export_t p = {0};
-  p.p_cfgfile  = effective_cfg(raw ? g_conf.cfg_raw : g_conf.cfg);   // export reflects bypassed modules
+  p.p_cfgfile  = effective_cfg(vid ? g_conf.cfg_vid : (raw ? g_conf.cfg_raw : g_conf.cfg));   // export reflects bypassed modules
   p.output_cnt = 2;
   p.output[0].inst             = dt_token("main");
   p.output[0].mod              = dt_token("o-jpg");
@@ -1424,7 +1543,7 @@ static int export_handler(struct mg_connection *c, void *u)
   p.output[1].colour_primaries = s_colour_primaries_srgb;
   p.output[1].colour_trc       = s_colour_trc_srgb;
   char imgline[1280];
-  snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", raw ? "i-raw" : "i-jpg", g_cur_image);
+  snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", vid ? "i-vid" : (raw ? "i-raw" : "i-jpg"), g_cur_image);
   char *extra[1] = { imgline }; p.extra_param_cnt = 1; p.p_extra_param = extra;
 
   int ok = 0;
@@ -1440,7 +1559,7 @@ static int export_handler(struct mg_connection *c, void *u)
         {
           line[strcspn(line, "\r\n")] = 0;
           if(strncmp(line, "param:", 6)) continue;
-          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12) || !strncmp(line, "param:o-", 8)) continue;
+          if(!strncmp(line, "param:i-jpg:", 12) || !strncmp(line, "param:i-raw:", 12) || !strncmp(line, "param:i-vid:", 12) || !strncmp(line, "param:o-", 8)) continue;
           dt_graph_read_config_line(&ex, line);
         }
         fclose(rf);
@@ -1529,6 +1648,7 @@ int main(int argc, char *argv[])
   mg_set_websocket_handler(ctx, "/ws", ws_connect, ws_ready, ws_data, ws_close, NULL);
   mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
   mg_set_request_handler(ctx, "/export", export_handler, NULL);
+  mg_set_request_handler(ctx, "/dl/", dl_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
