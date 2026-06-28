@@ -67,6 +67,7 @@ static char            g_cur_image[1024];      // current ORIGINAL image (not th
 static volatile int    g_dirty = 0;           // edits pending an autosave
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
 static FILE           *g_logf = NULL;         // optional logfile (config: logfile=)
+static int             g_has_nvenc = 0;       // detected once at startup: 1 if hevc_nvenc is available
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
@@ -638,9 +639,8 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, "{\"type\":\"export_error\",\"msg\":\"no video\"}", 40); return 1; }
     if(end < 0 || end >= fc) end = fc - 1;
     if(start < 0 || start >= fc) start = 0;
-    // detect hevc_nvenc once; fall back to libx265
-    static int has_nvenc = -1;
-    if(has_nvenc < 0) has_nvenc = (system("ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc") == 0);
+    // has_nvenc is detected once at server startup (see main()) and stored in g_has_nvenc
+    int has_nvenc = g_has_nvenc;
     char outpath[512];
     snprintf(outpath, sizeof(outpath), "%s/export_%ld.mkv", g_conf.libdir, (long)time(NULL));
     const char *icodec = g_conf.preview_webp ? "webp" : "mjpeg";
@@ -1464,7 +1464,9 @@ static int dl_handler(struct mg_connection *c, void *u)
   const char *uri = ri->local_uri ? ri->local_uri : "";
   const char *bn = uri + 4;   // skip "/dl/"
   for(const char *p = bn; *p; p++) if(*p=='/' || *p=='\\') { bn = p+1; }  // basename only
-  if(!*bn || strstr(bn, "..")) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
+  // reject traversal: must be a plain filename (no slashes, no dots-dot, no %-encoded slash)
+  if(!*bn || strstr(bn, "..") || strchr(bn, '/') || strchr(bn, '\\') || strstr(bn, "%2F") || strstr(bn, "%2f") || strstr(bn, "%5C"))
+  { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
   char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
   FILE *f = fopen(path, "rb"); if(!f) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
   fseek(f, 0, SEEK_END); long fsz = ftell(f); rewind(f);
@@ -1617,6 +1619,10 @@ int main(int argc, char *argv[])
     if(argc > 4) snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", argv[4]);
   }
   if(g_conf.logfile[0]) g_logf = fopen(g_conf.logfile, "a");
+
+  // detect hevc_nvenc once at startup so export_video doesn't block WS threads
+  g_has_nvenc = (system("ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc") == 0);
+  lg("srv", "nvenc encoder: %s", g_has_nvenc ? "yes" : "no (using libx265)");
 
   dt_log_init(s_log_cli);
   dt_pipe_global_init();
