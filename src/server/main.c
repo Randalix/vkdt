@@ -620,7 +620,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     char canonical[4096];
     if(!realpath(path_arg, canonical)) return 1;
     const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
-    if(strncmp(canonical, jail, strlen(jail))) return 1;  // outside jail
+    if(!jail_ok(canonical, jail)) return 1;  // outside jail
     if(g_dirty) recipe_save();
     lg("srv", "gallery_open %s", canonical);
     pthread_mutex_lock(&g_lock);
@@ -1479,6 +1479,39 @@ static void *autosave_thread(void *u)
   return NULL;
 }
 
+// gallery JSON helpers -------------------------------------------------
+// jail_ok: true if canonical is at or under jail.
+// Handles jail ending with '/' (e.g. "/") and without (e.g. "/home/j").
+static int jail_ok(const char *canonical, const char *jail)
+{
+  size_t jlen = strlen(jail);
+  if(strncmp(canonical, jail, jlen)) return 0;      // prefix mismatch
+  // if jail ends in '/', any prefix match is fine (jail="/" allows all abs paths)
+  if(jail[jlen-1] == '/') return 1;
+  // otherwise canonical must continue with '/' or '\0' (not e.g. "/home/joe" vs jail="/home/j")
+  return canonical[jlen] == '/' || canonical[jlen] == '\0';
+}
+// jw_snprintf: like snprintf but advances *p by at most what was actually written.
+// Prevents p from running past end when snprintf returns a larger "would-write" count.
+static void jw_snprintf(char **p, char *end, const char *fmt, ...)
+  __attribute__((format(printf, 3, 4)));
+static void jw_snprintf(char **p, char *end, const char *fmt, ...)
+{
+  ptrdiff_t avail = end - *p; if(avail <= 1) return;
+  va_list va; va_start(va, fmt);
+  int w = vsnprintf(*p, (size_t)avail, fmt, va); va_end(va);
+  if(w > 0) *p += (w < (int)avail ? w : (int)(avail - 1));
+}
+// jw_chars: append a string to the JSON buffer with quote/backslash escaping.
+// Stops writing when the buffer is within 2 bytes of end.
+static void jw_chars(char **p, char *end, const char *s)
+{
+  for(; *s && *p < end - 2; s++) {
+    if(*s == '"' || *s == '\\') *(*p)++ = '\\';
+    *(*p)++ = *s;
+  }
+}
+
 // helper: check file extension against a null-terminated list
 static int ext_in(const char *name, const char *const *list)
 {
@@ -1521,7 +1554,7 @@ static int gallery_list_handler(struct mg_connection *c, void *u)
     mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
     return 200;
   }
-  if(strncmp(canonical, jail, strlen(jail))) {
+  if(!jail_ok(canonical, jail)) {
     mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400;
   }
 
@@ -1539,13 +1572,9 @@ static int gallery_list_handler(struct mg_connection *c, void *u)
   if(!json) { closedir(dp); return 500; }
   char *p = json, *end = json + bufsz - 256;
 
-  // escape canonical for JSON (handle '" and \)
-  p += snprintf(p, (size_t)(end-p), "{\"dir\":\"");
-  for(const char *s = canonical; *s; s++) {
-    if(*s == '"' || *s == '\\') *p++ = '\\';
-    *p++ = *s;
-  }
-  p += snprintf(p, (size_t)(end-p), "\",\"folders\":[");
+  // build JSON using jw helpers (safe: never write past end)
+  jw_snprintf(&p, end, "{\"dir\":\""); jw_chars(&p, end, canonical);
+  jw_snprintf(&p, end, "\",\"folders\":[");
 
   int first = 1; struct dirent *de;
   while((de = readdir(dp)) != NULL) {
@@ -1553,15 +1582,12 @@ static int gallery_list_handler(struct mg_connection *c, void *u)
     char fpath[4096]; snprintf(fpath, sizeof(fpath), "%s/%s", canonical, de->d_name);
     struct stat st; if(stat(fpath, &st) != 0) continue;
     if(!S_ISDIR(st.st_mode)) continue;
-    if(!first) *p++ = ','; first = 0;
-    p += snprintf(p, (size_t)(end-p), "{\"name\":\"");
-    for(const char *s = de->d_name; *s; s++) {
-      if(*s == '"' || *s == '\\') *p++ = '\\';
-      *p++ = *s;
-    }
-    p += snprintf(p, (size_t)(end-p), "\"}");
+    if(end - p < 300) break;  // guard: 300 B minimum for a name entry
+    if(!first && p < end-1) *p++ = ','; first = 0;
+    jw_snprintf(&p, end, "{\"name\":\""); jw_chars(&p, end, de->d_name);
+    jw_snprintf(&p, end, "\"}");
   }
-  p += snprintf(p, (size_t)(end-p), "],\"items\":[");
+  jw_snprintf(&p, end, "],\"items\":[");
 
   first = 1; rewinddir(dp);
   while((de = readdir(dp)) != NULL) {
@@ -1571,22 +1597,15 @@ static int gallery_list_handler(struct mg_connection *c, void *u)
     if(!S_ISREG(st.st_mode)) continue;
     int is_vid = ext_in(de->d_name, vid_ext);
     if(!ext_in(de->d_name, img_ext) && !is_vid) continue;
+    if(end - p < (ptrdiff_t)(strlen(fpath) + 64)) break;  // guard: path + overhead
+    if(!first && p < end-1) *p++ = ','; first = 0;
     // item path = absolute path to file
-    if(!first) *p++ = ','; first = 0;
-    p += snprintf(p, (size_t)(end-p), "{\"name\":\"");
-    for(const char *s = de->d_name; *s; s++) {
-      if(*s == '"' || *s == '\\') *p++ = '\\';
-      *p++ = *s;
-    }
-    p += snprintf(p, (size_t)(end-p), "\",\"path\":\"");
-    for(const char *s = fpath; *s; s++) {
-      if(*s == '"' || *s == '\\') *p++ = '\\';
-      *p++ = *s;
-    }
-    p += snprintf(p, (size_t)(end-p), "\",\"is_vid\":%s,\"mtime\":%ld}",
+    jw_snprintf(&p, end, "{\"name\":\""); jw_chars(&p, end, de->d_name);
+    jw_snprintf(&p, end, "\",\"path\":\""); jw_chars(&p, end, fpath);
+    jw_snprintf(&p, end, "\",\"is_vid\":%s,\"mtime\":%ld}",
       is_vid ? "true" : "false", (long)st.st_mtime);
   }
-  p += snprintf(p, (size_t)(end-p), "]}");
+  jw_snprintf(&p, end, "]}");
   closedir(dp);
 
   size_t jslen = (size_t)(p - json);
@@ -1616,7 +1635,7 @@ static int gallery_media_handler(struct mg_connection *c, void *u)
     snprintf(candidate, sizeof(candidate), "%s/%s", g_conf.gallery_root, rel);  // relative (compat)
   char canonical[4096];
   if(!realpath(candidate, canonical)) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
-  if(strncmp(canonical, jail, strlen(jail))) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
+  if(!jail_ok(canonical, jail)) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
   if(access(canonical, R_OK) != 0) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
   mg_send_file(c, canonical); return 200;
 }
