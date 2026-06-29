@@ -36,6 +36,8 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <limits.h>
 #include <jpeglib.h>
 #include "cfg_rewire.h"   // pure rewire cfg-transform (shared with rewire_test.c)
 
@@ -71,10 +73,10 @@ static int             g_has_nvenc = 0;       // detected once at startup: 1 if 
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
-  char port[16], docroot[512], cfg[512], cfg_raw[512], cfg_vid[512], image[1024], libdir[512], logfile[512];
+  char port[16], docroot[512], cfg[512], cfg_raw[512], cfg_vid[512], image[1024], libdir[512], logfile[512], gallery_root[512], gallery_jail[512];
   int  proxy_max, preview_max, quality;
   int  preview_webp;   // 1 = stream webp preview frames (o-webp) instead of jpeg (o-jpg)
-} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "examples/m3_vid.cfg", "", "uploads", "rabbit.log", 1600, 1280, 90, 0 };
+} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "examples/m3_vid.cfg", "", "uploads", "rabbit.log", "", "", 1600, 1280, 90, 0 };
 
 // raw photo extensions -> use the i-raw pipeline (no jpeg proxy; vkdt decodes the raw)
 static int is_raw_path(const char *p)
@@ -131,6 +133,8 @@ static void load_config(const char *path)
     else if(!strcmp(k,"image"))       snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", v);
     else if(!strcmp(k,"libdir"))      snprintf(g_conf.libdir,  sizeof(g_conf.libdir),  "%s", v);
     else if(!strcmp(k,"logfile"))     snprintf(g_conf.logfile, sizeof(g_conf.logfile), "%s", v);
+    else if(!strcmp(k,"gallery_root")) snprintf(g_conf.gallery_root, sizeof(g_conf.gallery_root), "%s", v);
+    else if(!strcmp(k,"gallery_jail")) snprintf(g_conf.gallery_jail, sizeof(g_conf.gallery_jail), "%s", v);
     else if(!strcmp(k,"proxy_max"))   g_conf.proxy_max   = atoi(v);
     else if(!strcmp(k,"preview_max")) g_conf.preview_max = atoi(v);
     else if(!strcmp(k,"quality"))     g_conf.quality     = atoi(v);
@@ -605,6 +609,26 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       if(err) lg("err", "open failed: %s", path);
       else { after_graph_change(c); g_dirty = 0; }  // freshly opened: not dirty
     }
+    return 1;
+  }
+
+  if(!strncmp(tmp, "gallery_open ", 13))
+  { // open an image by absolute path (jail-checked)
+    if(!g_conf.gallery_root[0]) return 1;
+    const char *path_arg = tmp + 13;
+    if(!*path_arg || path_arg[0] != '/') return 1;
+    char canonical[4096];
+    if(!realpath(path_arg, canonical)) return 1;
+    const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
+    if(strncmp(canonical, jail, strlen(jail))) return 1;  // outside jail
+    if(g_dirty) recipe_save();
+    lg("srv", "gallery_open %s", canonical);
+    pthread_mutex_lock(&g_lock);
+    restore_overlays_from_sidecar(canonical);
+    int err = open_image(canonical);
+    pthread_mutex_unlock(&g_lock);
+    if(err) lg("err", "gallery_open failed: %s", canonical);
+    else { after_graph_change(c); g_dirty = 0; }
     return 1;
   }
 
@@ -1455,6 +1479,148 @@ static void *autosave_thread(void *u)
   return NULL;
 }
 
+// helper: check file extension against a null-terminated list
+static int ext_in(const char *name, const char *const *list)
+{
+  const char *dot = strrchr(name, '.'); if(!dot) return 0;
+  char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
+  for(int k = 0; list[k]; k++) if(!strcmp(e, list[k])) return 1;
+  return 0;
+}
+
+// GET /api/gallery/list?dir=<absolute_path>
+// dir: absolute path (starts with /); empty → gallery_root; relative → gallery_root/dir (compat).
+// Response: { "dir": "<abs>", "folders": [{name},...], "items": [{name,path,is_vid,mtime},...] }
+// path in items is the absolute path to the file (used by client for media URL + gallery_open).
+static int gallery_list_handler(struct mg_connection *c, void *u)
+{
+  (void)u;
+  if(!g_conf.gallery_root[0]) {
+    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
+    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
+    return 200;
+  }
+  const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
+  const struct mg_request_info *ri = mg_get_request_info(c);
+  char dir_param[4096] = "";
+  if(ri->query_string) mg_get_var(ri->query_string, strlen(ri->query_string), "dir", dir_param, sizeof(dir_param));
+
+  // resolve to an absolute path
+  char resolved[4096];
+  if(!dir_param[0])
+    snprintf(resolved, sizeof(resolved), "%s", g_conf.gallery_root);      // empty → root
+  else if(dir_param[0] == '/')
+    snprintf(resolved, sizeof(resolved), "%s", dir_param);                 // already absolute
+  else
+    snprintf(resolved, sizeof(resolved), "%s/%s", g_conf.gallery_root, dir_param); // relative (compat)
+
+  // canonicalize + jail check
+  char canonical[4096];
+  if(!realpath(resolved, canonical)) {
+    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
+    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
+    return 200;
+  }
+  if(strncmp(canonical, jail, strlen(jail))) {
+    mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400;
+  }
+
+  DIR *dp = opendir(canonical);
+  if(!dp) {
+    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
+    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
+    return 200;
+  }
+
+  static const char *img_ext[] = { "jpg","jpeg","png","webp","tif","tiff","dng","cr2","cr3","nef","arw","raf","rw2","orf", NULL };
+  static const char *vid_ext[] = { "mp4","mkv","mov","m4v","avi","webm", NULL };
+
+  size_t bufsz = 1<<20; char *json = malloc(bufsz);
+  if(!json) { closedir(dp); return 500; }
+  char *p = json, *end = json + bufsz - 256;
+
+  // escape canonical for JSON (handle '" and \)
+  p += snprintf(p, (size_t)(end-p), "{\"dir\":\"");
+  for(const char *s = canonical; *s; s++) {
+    if(*s == '"' || *s == '\\') *p++ = '\\';
+    *p++ = *s;
+  }
+  p += snprintf(p, (size_t)(end-p), "\",\"folders\":[");
+
+  int first = 1; struct dirent *de;
+  while((de = readdir(dp)) != NULL) {
+    if(de->d_name[0] == '.') continue;
+    char fpath[4096]; snprintf(fpath, sizeof(fpath), "%s/%s", canonical, de->d_name);
+    struct stat st; if(stat(fpath, &st) != 0) continue;
+    if(!S_ISDIR(st.st_mode)) continue;
+    if(!first) *p++ = ','; first = 0;
+    p += snprintf(p, (size_t)(end-p), "{\"name\":\"");
+    for(const char *s = de->d_name; *s; s++) {
+      if(*s == '"' || *s == '\\') *p++ = '\\';
+      *p++ = *s;
+    }
+    p += snprintf(p, (size_t)(end-p), "\"}");
+  }
+  p += snprintf(p, (size_t)(end-p), "],\"items\":[");
+
+  first = 1; rewinddir(dp);
+  while((de = readdir(dp)) != NULL) {
+    if(de->d_name[0] == '.') continue;
+    char fpath[4096]; snprintf(fpath, sizeof(fpath), "%s/%s", canonical, de->d_name);
+    struct stat st; if(stat(fpath, &st) != 0) continue;
+    if(!S_ISREG(st.st_mode)) continue;
+    int is_vid = ext_in(de->d_name, vid_ext);
+    if(!ext_in(de->d_name, img_ext) && !is_vid) continue;
+    // item path = absolute path to file
+    if(!first) *p++ = ','; first = 0;
+    p += snprintf(p, (size_t)(end-p), "{\"name\":\"");
+    for(const char *s = de->d_name; *s; s++) {
+      if(*s == '"' || *s == '\\') *p++ = '\\';
+      *p++ = *s;
+    }
+    p += snprintf(p, (size_t)(end-p), "\",\"path\":\"");
+    for(const char *s = fpath; *s; s++) {
+      if(*s == '"' || *s == '\\') *p++ = '\\';
+      *p++ = *s;
+    }
+    p += snprintf(p, (size_t)(end-p), "\",\"is_vid\":%s,\"mtime\":%ld}",
+      is_vid ? "true" : "false", (long)st.st_mtime);
+  }
+  p += snprintf(p, (size_t)(end-p), "]}");
+  closedir(dp);
+
+  size_t jslen = (size_t)(p - json);
+  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n", jslen);
+  mg_write(c, json, jslen); free(json); return 200;
+}
+
+// GET /api/gallery/media/<absolute_path>
+// Serves a file. When the client URL has an absolute path it becomes a double-slash:
+//   /api/gallery/media//home/j/DCIM/photo.jpg → rel = "/home/j/DCIM/photo.jpg"
+// Backward compat: relative rel (no leading /) → gallery_root/rel.
+static int gallery_media_handler(struct mg_connection *c, void *u)
+{
+  (void)u;
+  if(!g_conf.gallery_root[0]) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
+  const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
+  const struct mg_request_info *ri = mg_get_request_info(c);
+  const char *uri = ri->local_uri ? ri->local_uri : "";
+  const char *rel = uri + sizeof("/api/gallery/media/") - 1;
+  // build candidate path
+  char candidate[4096];
+  if(rel[0] == '/')
+    snprintf(candidate, sizeof(candidate), "%s", rel);   // absolute
+  else if(strstr(rel, ".."))
+    { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
+  else
+    snprintf(candidate, sizeof(candidate), "%s/%s", g_conf.gallery_root, rel);  // relative (compat)
+  char canonical[4096];
+  if(!realpath(candidate, canonical)) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
+  if(strncmp(canonical, jail, strlen(jail))) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
+  if(access(canonical, R_OK) != 0) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
+  mg_send_file(c, canonical); return 200;
+}
+
 // HTTP GET /dl/<filename> — serve a file from the library dir as a download.
 // Used by the client to download video exports produced by export_video.
 static int dl_handler(struct mg_connection *c, void *u)
@@ -1655,6 +1821,8 @@ int main(int argc, char *argv[])
   mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
   mg_set_request_handler(ctx, "/export", export_handler, NULL);
   mg_set_request_handler(ctx, "/dl/", dl_handler, NULL);
+  mg_set_request_handler(ctx, "/api/gallery/list", gallery_list_handler, NULL);
+  mg_set_request_handler(ctx, "/api/gallery/media/", gallery_media_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
