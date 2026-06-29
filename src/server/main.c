@@ -581,6 +581,40 @@ static void ws_ready(struct mg_connection *c, void *u)
   push_frame(c, s_graph_run_none);
 }
 
+// gallery helpers: defined here because they are used both in the WS handler (gallery_open)
+// and in the HTTP handlers below.
+
+// jail_ok: true if canonical is inside or at jail root.
+// Handles jail ending with '/' (e.g. "/") and without (e.g. "/home/j").
+static int jail_ok(const char *canonical, const char *jail)
+{
+  size_t jlen = strlen(jail);
+  if(strncmp(canonical, jail, jlen)) return 0;      // prefix mismatch
+  // if jail ends in '/', any prefix match is fine (jail="/" allows all abs paths)
+  if(jail[jlen-1] == '/') return 1;
+  // otherwise canonical must continue with '/' or '\0' (not e.g. "/home/joe" vs jail="/home/j")
+  return canonical[jlen] == '/' || canonical[jlen] == '\0';
+}
+// jw_snprintf: like snprintf but advances *p by at most what was actually written.
+// Prevents p from running past end when snprintf returns a larger "would-write" count.
+static void jw_snprintf(char **p, char *end, const char *fmt, ...)
+  __attribute__((format(printf, 3, 4)));
+static void jw_snprintf(char **p, char *end, const char *fmt, ...)
+{
+  ptrdiff_t avail = end - *p; if(avail <= 1) return;
+  va_list va; va_start(va, fmt);
+  int w = vsnprintf(*p, (size_t)avail, fmt, va); va_end(va);
+  if(w > 0) *p += (w < (int)avail ? w : (int)(avail - 1));
+}
+// jw_chars: append s to JSON buffer with quote/backslash escaping; stops within 2B of end.
+static void jw_chars(char **p, char *end, const char *s)
+{
+  for(; *s && *p < end - 2; s++) {
+    if(*s == '"' || *s == '\\') *(*p)++ = '\\';
+    *(*p)++ = *s;
+  }
+}
+
 static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *u)
 {
   (void)u;
@@ -1477,39 +1511,6 @@ static void *autosave_thread(void *u)
   (void)u;
   while(!g_stop) { sleep(2); if(g_dirty) { g_dirty = 0; recipe_save(); } }
   return NULL;
-}
-
-// gallery JSON helpers -------------------------------------------------
-// jail_ok: true if canonical is at or under jail.
-// Handles jail ending with '/' (e.g. "/") and without (e.g. "/home/j").
-static int jail_ok(const char *canonical, const char *jail)
-{
-  size_t jlen = strlen(jail);
-  if(strncmp(canonical, jail, jlen)) return 0;      // prefix mismatch
-  // if jail ends in '/', any prefix match is fine (jail="/" allows all abs paths)
-  if(jail[jlen-1] == '/') return 1;
-  // otherwise canonical must continue with '/' or '\0' (not e.g. "/home/joe" vs jail="/home/j")
-  return canonical[jlen] == '/' || canonical[jlen] == '\0';
-}
-// jw_snprintf: like snprintf but advances *p by at most what was actually written.
-// Prevents p from running past end when snprintf returns a larger "would-write" count.
-static void jw_snprintf(char **p, char *end, const char *fmt, ...)
-  __attribute__((format(printf, 3, 4)));
-static void jw_snprintf(char **p, char *end, const char *fmt, ...)
-{
-  ptrdiff_t avail = end - *p; if(avail <= 1) return;
-  va_list va; va_start(va, fmt);
-  int w = vsnprintf(*p, (size_t)avail, fmt, va); va_end(va);
-  if(w > 0) *p += (w < (int)avail ? w : (int)(avail - 1));
-}
-// jw_chars: append a string to the JSON buffer with quote/backslash escaping.
-// Stops writing when the buffer is within 2 bytes of end.
-static void jw_chars(char **p, char *end, const char *s)
-{
-  for(; *s && *p < end - 2; s++) {
-    if(*s == '"' || *s == '\\') *(*p)++ = '\\';
-    *(*p)++ = *s;
-  }
 }
 
 // helper: check file extension against a null-terminated list
