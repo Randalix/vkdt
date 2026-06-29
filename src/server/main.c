@@ -581,8 +581,7 @@ static void ws_ready(struct mg_connection *c, void *u)
   push_frame(c, s_graph_run_none);
 }
 
-// gallery helpers: defined here because they are used both in the WS handler (gallery_open)
-// and in the HTTP handlers below.
+// gallery_open helper used in the WS handler (ws_data).
 
 // jail_ok: true if canonical is inside or at jail root.
 // Handles jail ending with '/' (e.g. "/") and without (e.g. "/home/j").
@@ -595,26 +594,6 @@ static int jail_ok(const char *canonical, const char *jail)
   // otherwise canonical must continue with '/' or '\0' (not e.g. "/home/joe" vs jail="/home/j")
   return canonical[jlen] == '/' || canonical[jlen] == '\0';
 }
-// jw_snprintf: like snprintf but advances *p by at most what was actually written.
-// Prevents p from running past end when snprintf returns a larger "would-write" count.
-static void jw_snprintf(char **p, char *end, const char *fmt, ...)
-  __attribute__((format(printf, 3, 4)));
-static void jw_snprintf(char **p, char *end, const char *fmt, ...)
-{
-  ptrdiff_t avail = end - *p; if(avail <= 1) return;
-  va_list va; va_start(va, fmt);
-  int w = vsnprintf(*p, (size_t)avail, fmt, va); va_end(va);
-  if(w > 0) *p += (w < (int)avail ? w : (int)(avail - 1));
-}
-// jw_chars: append s to JSON buffer with quote/backslash escaping; stops within 2B of end.
-static void jw_chars(char **p, char *end, const char *s)
-{
-  for(; *s && *p < end - 2; s++) {
-    if(*s == '"' || *s == '\\') *(*p)++ = '\\';
-    *(*p)++ = *s;
-  }
-}
-
 static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *u)
 {
   (void)u;
@@ -1513,134 +1492,6 @@ static void *autosave_thread(void *u)
   return NULL;
 }
 
-// helper: check file extension against a null-terminated list
-static int ext_in(const char *name, const char *const *list)
-{
-  const char *dot = strrchr(name, '.'); if(!dot) return 0;
-  char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
-  for(int k = 0; list[k]; k++) if(!strcmp(e, list[k])) return 1;
-  return 0;
-}
-
-// GET /api/gallery/list?dir=<absolute_path>
-// dir: absolute path (starts with /); empty → gallery_root; relative → gallery_root/dir (compat).
-// Response: { "dir": "<abs>", "folders": [{name},...], "items": [{name,path,is_vid,mtime},...] }
-// path in items is the absolute path to the file (used by client for media URL + gallery_open).
-static int gallery_list_handler(struct mg_connection *c, void *u)
-{
-  (void)u;
-  if(!g_conf.gallery_root[0]) {
-    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
-    return 200;
-  }
-  const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
-  const struct mg_request_info *ri = mg_get_request_info(c);
-  char dir_param[4096] = "";
-  if(ri->query_string) mg_get_var(ri->query_string, strlen(ri->query_string), "dir", dir_param, sizeof(dir_param));
-
-  // resolve to an absolute path
-  char resolved[4096];
-  if(!dir_param[0])
-    snprintf(resolved, sizeof(resolved), "%s", g_conf.gallery_root);      // empty → root
-  else if(dir_param[0] == '/')
-    snprintf(resolved, sizeof(resolved), "%s", dir_param);                 // already absolute
-  else
-    snprintf(resolved, sizeof(resolved), "%s/%s", g_conf.gallery_root, dir_param); // relative (compat)
-
-  // canonicalize + jail check
-  char canonical[4096];
-  if(!realpath(resolved, canonical)) {
-    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
-    return 200;
-  }
-  if(!jail_ok(canonical, jail)) {
-    mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400;
-  }
-
-  DIR *dp = opendir(canonical);
-  if(!dp) {
-    const char *j = "{\"dir\":\"\",\"folders\":[],\"items\":[]}";
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(j), j);
-    return 200;
-  }
-
-  static const char *img_ext[] = { "jpg","jpeg","png","webp","tif","tiff","dng","cr2","cr3","nef","arw","raf","rw2","orf", NULL };
-  static const char *vid_ext[] = { "mp4","mkv","mov","m4v","avi","webm", NULL };
-
-  size_t bufsz = 1<<20; char *json = malloc(bufsz);
-  if(!json) { closedir(dp); return 500; }
-  char *p = json, *end = json + bufsz - 256;
-
-  // build JSON using jw helpers (safe: never write past end)
-  jw_snprintf(&p, end, "{\"dir\":\""); jw_chars(&p, end, canonical);
-  jw_snprintf(&p, end, "\",\"folders\":[");
-
-  int first = 1; struct dirent *de;
-  while((de = readdir(dp)) != NULL) {
-    if(de->d_name[0] == '.') continue;
-    char fpath[4096]; snprintf(fpath, sizeof(fpath), "%s/%s", canonical, de->d_name);
-    struct stat st; if(stat(fpath, &st) != 0) continue;
-    if(!S_ISDIR(st.st_mode)) continue;
-    if(end - p < 300) break;  // guard: 300 B minimum for a name entry
-    if(!first && p < end-1) *p++ = ','; first = 0;
-    jw_snprintf(&p, end, "{\"name\":\""); jw_chars(&p, end, de->d_name);
-    jw_snprintf(&p, end, "\"}");
-  }
-  jw_snprintf(&p, end, "],\"items\":[");
-
-  first = 1; rewinddir(dp);
-  while((de = readdir(dp)) != NULL) {
-    if(de->d_name[0] == '.') continue;
-    char fpath[4096]; snprintf(fpath, sizeof(fpath), "%s/%s", canonical, de->d_name);
-    struct stat st; if(stat(fpath, &st) != 0) continue;
-    if(!S_ISREG(st.st_mode)) continue;
-    int is_vid = ext_in(de->d_name, vid_ext);
-    if(!ext_in(de->d_name, img_ext) && !is_vid) continue;
-    if(end - p < (ptrdiff_t)(strlen(fpath) + 64)) break;  // guard: path + overhead
-    if(!first && p < end-1) *p++ = ','; first = 0;
-    // item path = absolute path to file
-    jw_snprintf(&p, end, "{\"name\":\""); jw_chars(&p, end, de->d_name);
-    jw_snprintf(&p, end, "\",\"path\":\""); jw_chars(&p, end, fpath);
-    jw_snprintf(&p, end, "\",\"is_vid\":%s,\"mtime\":%ld}",
-      is_vid ? "true" : "false", (long)st.st_mtime);
-  }
-  jw_snprintf(&p, end, "]}");
-  closedir(dp);
-
-  size_t jslen = (size_t)(p - json);
-  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n", jslen);
-  mg_write(c, json, jslen); free(json); return 200;
-}
-
-// GET /api/gallery/media/<absolute_path>
-// Serves a file. When the client URL has an absolute path it becomes a double-slash:
-//   /api/gallery/media//home/j/DCIM/photo.jpg → rel = "/home/j/DCIM/photo.jpg"
-// Backward compat: relative rel (no leading /) → gallery_root/rel.
-static int gallery_media_handler(struct mg_connection *c, void *u)
-{
-  (void)u;
-  if(!g_conf.gallery_root[0]) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
-  const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
-  const struct mg_request_info *ri = mg_get_request_info(c);
-  const char *uri = ri->local_uri ? ri->local_uri : "";
-  const char *rel = uri + sizeof("/api/gallery/media/") - 1;
-  // build candidate path
-  char candidate[4096];
-  if(rel[0] == '/')
-    snprintf(candidate, sizeof(candidate), "%s", rel);   // absolute
-  else if(strstr(rel, ".."))
-    { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
-  else
-    snprintf(candidate, sizeof(candidate), "%s/%s", g_conf.gallery_root, rel);  // relative (compat)
-  char canonical[4096];
-  if(!realpath(candidate, canonical)) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
-  if(!jail_ok(canonical, jail)) { mg_printf(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); return 400; }
-  if(access(canonical, R_OK) != 0) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
-  mg_send_file(c, canonical); return 200;
-}
-
 // HTTP GET /dl/<filename> — serve a file from the library dir as a download.
 // Used by the client to download video exports produced by export_video.
 static int dl_handler(struct mg_connection *c, void *u)
@@ -1841,8 +1692,6 @@ int main(int argc, char *argv[])
   mg_set_request_handler(ctx, "/upload", upload_handler, NULL);
   mg_set_request_handler(ctx, "/export", export_handler, NULL);
   mg_set_request_handler(ctx, "/dl/", dl_handler, NULL);
-  mg_set_request_handler(ctx, "/api/gallery/list", gallery_list_handler, NULL);
-  mg_set_request_handler(ctx, "/api/gallery/media/", gallery_media_handler, NULL);
 
   pthread_t as; pthread_create(&as, NULL, autosave_thread, NULL);  // debounced recipe autosave
 
