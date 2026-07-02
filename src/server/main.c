@@ -1507,9 +1507,14 @@ static int dl_handler(struct mg_connection *c, void *u)
   char path[1024]; snprintf(path, sizeof(path), "%s/%s", g_conf.libdir, bn);
   FILE *f = fopen(path, "rb"); if(!f) { mg_printf(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"); return 404; }
   fseek(f, 0, SEEK_END); long fsz = ftell(f); rewind(f);
-  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/x-matroska\r\n"
+  // Content-Type from the actual file extension: a mismatch (e.g. .mp4 served as
+  // video/x-matroska) makes Chrome append a "corrective" extension on download,
+  // yielding a broken double-extension filename (export_....mp4.mkv).
+  const char *dot = strrchr(bn, '.');
+  const char *ctype = (dot && !strcasecmp(dot, ".mp4")) ? "video/mp4" : "video/x-matroska";
+  mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
                "Content-Disposition: attachment; filename=\"%s\"\r\n"
-               "Content-Length: %ld\r\n\r\n", bn, fsz);
+               "Content-Length: %ld\r\n\r\n", ctype, bn, fsz);
   char buf[65536]; int n;
   while((n = (int)fread(buf, 1, sizeof(buf), f)) > 0) mg_write(c, buf, (size_t)n);
   fclose(f);
