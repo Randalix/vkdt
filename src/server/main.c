@@ -679,7 +679,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     // has_nvenc is detected once at server startup (see main()) and stored in g_has_nvenc
     int has_nvenc = g_has_nvenc;
     char outpath[512];
-    snprintf(outpath, sizeof(outpath), "%s/export_%ld.mkv", g_conf.libdir, (long)time(NULL));
+    snprintf(outpath, sizeof(outpath), "%s/export_%ld.mp4", g_conf.libdir, (long)time(NULL));
     const char *icodec = g_conf.preview_webp ? "webp" : "mjpeg";
     char ffcmd[1024];
     if(has_nvenc)
