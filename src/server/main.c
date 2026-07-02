@@ -70,6 +70,13 @@ static volatile int    g_dirty = 0;           // edits pending an autosave
 static uint32_t        g_history_base = 0;    // history items below this are the baseline snapshot
 static FILE           *g_logf = NULL;         // optional logfile (config: logfile=)
 static int             g_has_nvenc = 0;       // detected once at startup: 1 if hevc_nvenc is available
+// export job status — decoupled from the WS connection that started it, so a reconnecting
+// client (backgrounding, WLAN switch, tab reload) can recover progress/result. protected by
+// g_lock the same way other cross-thread-mutated state in this file is (see bypass/addmod).
+static int              g_export_running = 0;
+static int              g_export_frame = 0, g_export_total = 0;
+static char             g_export_file[256] = {0};
+static char             g_export_err[256] = {0};
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
@@ -693,14 +700,25 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
           "-vf unsharp=3:3:1.0 -c:v libx265 -preset slow -crf 18 "
           "-x265-params no-sao=1:psy-rdoq=2.00:aq-mode=3:deblock=-1,-1 "
           "-movflags +faststart \"%s\" 2>/dev/null", icodec, fps, outpath);
+    int total = end - start + 1;
     FILE *fp = popen(ffcmd, "w");
     if(!fp)
-    { mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, "{\"type\":\"export_error\",\"msg\":\"ffmpeg failed\"}", 46); return 1; }
-    int total = end - start + 1;
+    {
+      pthread_mutex_lock(&g_lock);
+      g_export_running = 0;
+      snprintf(g_export_err, sizeof(g_export_err), "ffmpeg failed");
+      pthread_mutex_unlock(&g_lock);
+      mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, "{\"type\":\"export_error\",\"msg\":\"ffmpeg failed\"}", 46); return 1;
+    }
+    pthread_mutex_lock(&g_lock);
+    g_export_running = 1; g_export_frame = 0; g_export_total = total;
+    g_export_file[0] = 0; g_export_err[0] = 0;
+    pthread_mutex_unlock(&g_lock);
     for(int fn = start; fn <= end; fn++)
     {
       pthread_mutex_lock(&g_lock);
       g_graph.frame = fn;
+      g_export_frame = fn - start + 1;   // cheap int write — updated every frame, unlike the WS push below
       size_t n = 0; double ms = 0;
       unsigned char *b = render_to_jpeg(&n, &ms, s_graph_run_all);
       pthread_mutex_unlock(&g_lock);
@@ -714,13 +732,32 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     }
     int ret = pclose(fp);
     char result[256];
+    pthread_mutex_lock(&g_lock);
+    g_export_running = 0;
     if(ret == 0)
     { const char *fn = strrchr(outpath, '/'); fn = fn ? fn+1 : outpath;
+      snprintf(g_export_file, sizeof(g_export_file), "%s", fn);
       snprintf(result, sizeof(result), "{\"type\":\"export_done\",\"file\":\"%s\"}", fn); }
     else
-      snprintf(result, sizeof(result), "{\"type\":\"export_error\",\"msg\":\"encode failed (ret=%d)\"}", ret);
+    { snprintf(g_export_err, sizeof(g_export_err), "encode failed (ret=%d)", ret);
+      snprintf(result, sizeof(result), "{\"type\":\"export_error\",\"msg\":\"encode failed (ret=%d)\"}", ret); }
+    pthread_mutex_unlock(&g_lock);
     mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, result, strlen(result));
     lg("srv", "export_video %d..%d -> %s (ret=%d)", start, end, outpath, ret);
+    return 1;
+  }
+  if(!strncmp(tmp, "export_status", 13))
+  { // query the export job status — independent of which connection started/is watching it.
+    // lets a reconnecting client (backgrounding, WLAN switch, tab reload) recover progress/result.
+    pthread_mutex_lock(&g_lock);
+    int running = g_export_running, frame = g_export_frame, total = g_export_total;
+    char file[256]; snprintf(file, sizeof(file), "%s", g_export_file);
+    char err[256];  snprintf(err,  sizeof(err),  "%s", g_export_err);
+    pthread_mutex_unlock(&g_lock);
+    char msg[700];
+    snprintf(msg, sizeof(msg), "{\"type\":\"export_status\",\"running\":%s,\"frame\":%d,\"total\":%d,\"file\":\"%s\",\"err\":\"%s\"}",
+        running ? "true" : "false", frame, total, file, err);
+    mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, msg, strlen(msg));
     return 1;
   }
   { int mi;   // fitcrop <modid> : auto-fit the crop to the rotated inscribed rect (vkdt's own geometry, item 32 v2)
