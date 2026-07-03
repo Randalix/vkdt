@@ -1743,7 +1743,11 @@ static VkResult qvk_init_with_timeout(int *timed_out)
 
   pthread_t th;
   if(pthread_create(&th, NULL, qvk_init_thread_fn, &c))
+  {
+    pthread_mutex_destroy(&c.mutex);
+    pthread_cond_destroy(&c.cond);
     return qvk_init(0, -1, 0, 0, 0);  // couldn't even spin up the thread: fall back to a direct, blocking call
+  }
 
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -1760,12 +1764,17 @@ static VkResult qvk_init_with_timeout(int *timed_out)
 
   if(!done)
   {
+    // timed out: leave mutex/cond alive -- the detached thread may still
+    // touch them from inside the wedged driver call. the whole context is
+    // reclaimed for free when the process exit()s right after this returns.
     pthread_detach(th);
     lg("err", "qvk_init did not return within %ds -- possible GPU/driver wedge, exiting", timeout_s);
     *timed_out = 1;
     return VK_NOT_READY;
   }
   pthread_join(th, NULL);
+  pthread_mutex_destroy(&c.mutex);
+  pthread_cond_destroy(&c.cond);
   return ret;
 }
 
