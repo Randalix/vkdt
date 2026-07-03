@@ -38,6 +38,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
+#include <errno.h>
 #include <jpeglib.h>
 #include "cfg_rewire.h"   // pure rewire cfg-transform (shared with rewire_test.c)
 
@@ -1684,6 +1685,90 @@ static int export_handler(struct mg_connection *c, void *u)
 
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
+// --- qvk_init timeout guard --------------------------------------------------
+// a wedged GPU/display driver can make qvk_init() (vulkan instance + device
+// creation, src/qvk/qvk.c) block forever with zero diagnostics: the process
+// just sits at "active (running)" forever -- no log line, no crash, nothing
+// short of a kernel stack dump tells you why. run it on its own thread and
+// give the wait a timeout, so a wedge becomes a fast, loud, restartable
+// failure instead of a silent, unbounded hang. qvk_init()/qvk.c itself is
+// untouched -- this only wraps the call from the outside.
+// see: rabbit_editor/issues/vkdt_server_hang_in_poll_before_qvk_init.md
+#define VKDT_QVK_INIT_TIMEOUT_S_DEFAULT 20  // a healthy qvk_init() typically returns in well under 1s
+
+typedef struct qvk_init_ctx_t
+{
+  VkResult        ret;
+  int             done;
+  pthread_mutex_t mutex;
+  pthread_cond_t  cond;
+}
+qvk_init_ctx_t;
+
+static void *qvk_init_thread_fn(void *arg)
+{
+  qvk_init_ctx_t *c = arg;
+  // test-only hook: artificially delay before the real qvk_init() call, so the
+  // timeout path below can be exercised (red/green regression test) without
+  // provoking an actual driver wedge. inert unless the env var is set --
+  // default behaviour (no env var) is identical to calling qvk_init() directly.
+  const char *hang_s = getenv("VKDT_DEBUG_INIT_HANG_S");
+  if(hang_s && atoi(hang_s) > 0) sleep((unsigned)atoi(hang_s));
+  VkResult ret = qvk_init(0, -1, 0, 0, 0);
+  pthread_mutex_lock(&c->mutex);
+  c->ret  = ret;
+  c->done = 1;
+  pthread_cond_signal(&c->cond);
+  pthread_mutex_unlock(&c->mutex);
+  return NULL;
+}
+
+// runs qvk_init() on its own thread and waits for it with a timeout.
+// on success: *timed_out = 0, return value is qvk_init()'s own VkResult.
+// on timeout: *timed_out = 1 (already logged), return value is meaningless.
+// the init thread is deliberately detached, not joined, on timeout: it may
+// still be stuck inside the vulkan loader/driver forever (that's the whole
+// premise of a wedge) and there is no safe way to cancel it. the caller is
+// expected to exit() right after, so the abandoned thread dies with the process.
+static VkResult qvk_init_with_timeout(int *timed_out)
+{
+  *timed_out = 0;
+  int timeout_s = VKDT_QVK_INIT_TIMEOUT_S_DEFAULT;
+  const char *timeout_env = getenv("VKDT_QVK_INIT_TIMEOUT_S");  // test-only override of the production timeout
+  if(timeout_env && atoi(timeout_env) > 0) timeout_s = atoi(timeout_env);
+
+  qvk_init_ctx_t c = { .ret = VK_NOT_READY, .done = 0 };
+  pthread_mutex_init(&c.mutex, NULL);
+  pthread_cond_init(&c.cond, NULL);
+
+  pthread_t th;
+  if(pthread_create(&th, NULL, qvk_init_thread_fn, &c))
+    return qvk_init(0, -1, 0, 0, 0);  // couldn't even spin up the thread: fall back to a direct, blocking call
+
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec += timeout_s;
+
+  pthread_mutex_lock(&c.mutex);
+  while(!c.done)
+  {
+    if(pthread_cond_timedwait(&c.cond, &c.mutex, &ts) == ETIMEDOUT) break;
+  }
+  int done = c.done;
+  VkResult ret = c.ret;
+  pthread_mutex_unlock(&c.mutex);
+
+  if(!done)
+  {
+    pthread_detach(th);
+    lg("err", "qvk_init did not return within %ds -- possible GPU/driver wedge, exiting", timeout_s);
+    *timed_out = 1;
+    return VK_NOT_READY;
+  }
+  pthread_join(th, NULL);
+  return ret;
+}
+
 int main(int argc, char *argv[])
 {
   // config: a single .conf path, else ./rabbit.conf with legacy positional overrides
@@ -1706,7 +1791,10 @@ int main(int argc, char *argv[])
   dt_log_init(s_log_cli);
   dt_pipe_global_init();
   threads_global_init();
-  if(qvk_init(0, -1, 0, 0, 0)) { lg("err", "qvk_init failed"); return 1; }
+  int qvk_timed_out = 0;
+  VkResult qvk_ret = qvk_init_with_timeout(&qvk_timed_out);
+  if(qvk_timed_out) exit(1);  // qvk_init_with_timeout() already logged the reason
+  if(qvk_ret) { lg("err", "qvk_init failed"); return 1; }
 
   mkdir(g_conf.libdir, 0755);            // library / upload directory (relative to cwd)
   const char *image = g_conf.image[0] ? g_conf.image : NULL;
