@@ -602,6 +602,17 @@ static int jail_ok(const char *canonical, const char *jail)
   // otherwise canonical must continue with '/' or '\0' (not e.g. "/home/joe" vs jail="/home/j")
   return canonical[jlen] == '/' || canonical[jlen] == '\0';
 }
+
+// gallery_open was silently dropping rejected requests (no log line, no client response --
+// indistinguishable from a hang on the client). log every reject + tell the client why, instead.
+static void gallery_open_reject(struct mg_connection *c, const char *reason, const char *path)
+{
+  lg("err", "gallery_open rejected (%s): %s", reason, path ? path : "");
+  char msg[512];
+  int n = snprintf(msg, sizeof(msg), "{\"type\":\"error\",\"msg\":\"gallery_open: %s\"}", reason);
+  if(n > 0) mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, msg, (size_t)n);
+}
+
 static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *u)
 {
   (void)u;
@@ -635,13 +646,13 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
 
   if(!strncmp(tmp, "gallery_open ", 13))
   { // open an image by absolute path (jail-checked)
-    if(!g_conf.gallery_root[0]) return 1;
     const char *path_arg = tmp + 13;
-    if(!*path_arg || path_arg[0] != '/') return 1;
+    if(!g_conf.gallery_root[0]) { gallery_open_reject(c, "gallery_root not configured on server", path_arg); return 1; }
+    if(!*path_arg || path_arg[0] != '/') { gallery_open_reject(c, "path must be absolute", path_arg); return 1; }
     char canonical[4096];
-    if(!realpath(path_arg, canonical)) return 1;
+    if(!realpath(path_arg, canonical)) { gallery_open_reject(c, "path not found", path_arg); return 1; }
     const char *jail = g_conf.gallery_jail[0] ? g_conf.gallery_jail : g_conf.gallery_root;
-    if(!jail_ok(canonical, jail)) return 1;  // outside jail
+    if(!jail_ok(canonical, jail)) { gallery_open_reject(c, "outside jail", canonical); return 1; }  // outside jail
     if(g_dirty) recipe_save();
     lg("srv", "gallery_open %s", canonical);
     pthread_mutex_lock(&g_lock);
@@ -1809,7 +1820,8 @@ int main(int argc, char *argv[])
   const char *image = g_conf.image[0] ? g_conf.image : NULL;
   restore_overlays_from_sidecar(image);   // restart-persistence: bring back inserted modules
   if(open_image(image)) { lg("err", "initial open failed"); return 1; }
-  lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s  preview=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile, g_conf.preview_webp ? "webp" : "jpeg");
+  lg("srv", "graph warm. menu=%zu B  libdir=%s  log=%s  preview=%s  gallery=%s", strlen(g_menu_json), g_conf.libdir, g_conf.logfile, g_conf.preview_webp ? "webp" : "jpeg",
+      g_conf.gallery_root[0] ? g_conf.gallery_root : "disabled");
 
   signal(SIGINT, on_sigint);
   mg_init_library(0);
