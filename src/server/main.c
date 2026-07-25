@@ -613,6 +613,19 @@ static void gallery_open_reject(struct mg_connection *c, const char *reason, con
   if(n > 0) mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, msg, (size_t)n);
 }
 
+// open_image() has three silent return-1 failure paths (effective_cfg scratch buffer
+// overflow, make_proxy() decode failure -- e.g. a real PNG hitting the libjpeg-only
+// decoder, dt_graph_export() failure): all of them were previously only logged, never
+// reported to the client -- indistinguishable from the hang this same pattern already
+// fixed for gallery_open_reject() above. Log the specific reason server-side (unchanged),
+// but only ever send a generic message to the client (no path/reason leak).
+static void open_image_failed(struct mg_connection *c, const char *cmd, const char *path)
+{
+  lg("err", "%s failed: %s", cmd, path ? path : "");
+  static const char msg[] = "{\"type\":\"error\",\"msg\":\"could not open image\"}";
+  mg_websocket_write(c, MG_WEBSOCKET_OPCODE_TEXT, msg, sizeof(msg) - 1);
+}
+
 static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *u)
 {
   (void)u;
@@ -638,7 +651,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
       restore_overlays_from_sidecar(path);   // bring back this image's addmod/rewire/preset overlays
       int err = open_image(path);
       pthread_mutex_unlock(&g_lock);
-      if(err) lg("err", "open failed: %s", path);
+      if(err) open_image_failed(c, "open", path);
       else { after_graph_change(c); g_dirty = 0; }  // freshly opened: not dirty
     }
     return 1;
@@ -659,7 +672,7 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     restore_overlays_from_sidecar(canonical);
     int err = open_image(canonical);
     pthread_mutex_unlock(&g_lock);
-    if(err) lg("err", "gallery_open failed: %s", canonical);
+    if(err) open_image_failed(c, "gallery_open", canonical);
     else { after_graph_change(c); g_dirty = 0; }
     return 1;
   }
