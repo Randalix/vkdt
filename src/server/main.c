@@ -81,10 +81,10 @@ static char             g_export_err[256] = {0};
 
 // all server settings live here; loaded from a config file (key=value), CLI args override.
 static struct {
-  char port[16], docroot[512], cfg[512], cfg_raw[512], cfg_vid[512], image[1024], libdir[512], logfile[512], gallery_root[512], gallery_jail[512];
+  char port[16], docroot[512], cfg[512], cfg_raw[512], cfg_vid[512], cfg_exr[512], image[1024], libdir[512], logfile[512], gallery_root[512], gallery_jail[512];
   int  proxy_max, preview_max, quality;
   int  preview_webp;   // 1 = stream webp preview frames (o-webp) instead of jpeg (o-jpg)
-} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "examples/m3_vid.cfg", "", "uploads", "rabbit.log", "", "", 1600, 1280, 90, 0 };
+} g_conf = { "8090", "../web", "examples/m3.cfg", "examples/m3_raw.cfg", "examples/m3_vid.cfg", "examples/m3_exr.cfg", "", "uploads", "rabbit.log", "", "", 1600, 1280, 90, 0 };
 
 // raw photo extensions -> use the i-raw pipeline (no jpeg proxy; vkdt decodes the raw)
 static int is_raw_path(const char *p)
@@ -103,6 +103,21 @@ static int is_vid_path(const char *p)
   char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
   static const char *vid[] = { "mp4","mkv","mov","avi","webm","m4v", NULL };
   for(int k = 0; vid[k]; k++) if(!strcmp(e, vid[k])) return 1;
+  return 0;
+}
+
+// non-jpeg raster formats that make_proxy()'s libjpeg decoder can't touch (previously a silent
+// "could not open image" -- see PNG-Open Silent-Fail Härtung) but ffmpeg CAN decode in this build
+// -> convert on the fly to a scene-linear EXR proxy (make_exr_proxy()) and feed vkdt's native,
+// unmodified i-exr module instead, for full float precision + real graph editing (see the
+// PNG-zu-EXR plan). HEIC/HEIF is deliberately excluded: no decoder in this ffmpeg build, so it
+// keeps falling back to the existing visible error -- accepted, not a regression.
+static int is_exr_convertible_path(const char *p)
+{
+  const char *dot = strrchr(p, '.'); if(!dot) return 0;
+  char e[8]; int i = 0; for(const char *s = dot+1; s[i] && i < 7; i++) e[i] = tolower((unsigned char)s[i]); e[i] = 0;
+  static const char *rc[] = { "png","webp","tif","tiff","bmp", NULL };
+  for(int k = 0; rc[k]; k++) if(!strcmp(e, rc[k])) return 1;
   return 0;
 }
 
@@ -138,6 +153,7 @@ static void load_config(const char *path)
     else if(!strcmp(k,"cfg"))         snprintf(g_conf.cfg,     sizeof(g_conf.cfg),     "%s", v);
     else if(!strcmp(k,"cfg_raw"))     snprintf(g_conf.cfg_raw, sizeof(g_conf.cfg_raw), "%s", v);
     else if(!strcmp(k,"cfg_vid"))     snprintf(g_conf.cfg_vid, sizeof(g_conf.cfg_vid), "%s", v);
+    else if(!strcmp(k,"cfg_exr"))     snprintf(g_conf.cfg_exr, sizeof(g_conf.cfg_exr), "%s", v);
     else if(!strcmp(k,"image"))       snprintf(g_conf.image,   sizeof(g_conf.image),   "%s", v);
     else if(!strcmp(k,"libdir"))      snprintf(g_conf.libdir,  sizeof(g_conf.libdir),  "%s", v);
     else if(!strcmp(k,"logfile"))     snprintf(g_conf.logfile, sizeof(g_conf.logfile), "%s", v);
@@ -1215,6 +1231,29 @@ static int make_proxy(const char *in, const char *out, int maxdim)
   return 0;
 }
 
+// convert `in` (png/webp/tiff/bmp, see is_exr_convertible_path()) to a scene-linear EXR proxy
+// `out`, capped to maxdim on the long side (same CPU-side cap make_proxy() applies via
+// g_conf.proxy_max). Runs ffmpeg via popen(), the same subprocess pattern export_video() above
+// uses for its h265 pipe -- ffmpeg is already a runtime dependency of this server, no new tool.
+// The zscale filter degammas sRGB -> linear before the float EXR is written: PNG-zu-EXR plan §4
+// measured this empirically (a 128,128,128 sRGB patch round-trips to 0.500 linear WITHOUT this
+// filter -- wrong, plain integer/255 rescale -- vs. 0.216 WITH it -- correct sRGB EOTF, matches
+// vkdt's expectation of scene-linear input). `prim`/`trc` on the i-exr module (set via open_image()'s
+// extra_param, not here) tell vkdt the data is already linear sRGB/rec709 primaries, since ffmpeg's
+// exr encoder writes no chromaticities/trc custom attributes for i-exr's header parser to pick up.
+static int make_exr_proxy(const char *in, const char *out, int maxdim)
+{
+  char cmd[2048];
+  snprintf(cmd, sizeof(cmd),
+      "ffmpeg -y -i \"%s\" -vf \"scale=%d:%d:force_original_aspect_ratio=decrease,"
+      "zscale=transferin=iec61966-2-1:transfer=linear\" -pix_fmt gbrpf32le -update 1 \"%s\" "
+      "2>/dev/null", in, maxdim, maxdim, out);
+  FILE *fp = popen(cmd, "r");
+  if(!fp) return 1;
+  int ret = pclose(fp);
+  return ret == 0 ? 0 : 1;
+}
+
 // (re)build the warm graph for `image` (NULL = use the cfg's own input). Tears down any
 // previous graph, exports the template pipeline against a downscaled preview proxy,
 // restores the image's recipe sidecar (param overlay), and baselines history. Call with
@@ -1424,16 +1463,27 @@ static int open_image(const char *image)
   // Proxy/decode runs BEFORE graph teardown so a bad file leaves the current session intact.
   const int raw = image && is_raw_path(image);
   const int vid = image && is_vid_path(image);
-  const char *cfg = effective_cfg(vid ? g_conf.cfg_vid : (raw ? g_conf.cfg_raw : g_conf.cfg));
+  const int rasterconv = image && !raw && !vid && is_exr_convertible_path(image);   // png/webp/tiff/bmp -> exr proxy
+  const char *cfg = effective_cfg(vid ? g_conf.cfg_vid : (raw ? g_conf.cfg_raw : (rasterconv ? g_conf.cfg_exr : g_conf.cfg)));
   if(g_cfg_overflow) { lg("err", "effective_cfg overflowed scratch buffer — rejecting rebuild"); return 1; }
-  const char *inmod = vid ? "i-vid" : (raw ? "i-raw" : "i-jpg");
+  const char *inmod = vid ? "i-vid" : (raw ? "i-raw" : (rasterconv ? "i-exr" : "i-jpg"));
   char proxypath[1024] = "", abspath[1024]; const char *use_image = image;
   if(image && !raw && !vid)
   {
-    snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
-    if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
-    { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
-    else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
+    if(rasterconv)
+    {
+      snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.exr");
+      if(make_exr_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
+      { use_image = proxypath; lg("srv", "exr preview proxy <- %s", image); }
+      else { lg("err", "cannot convert %s to exr (ffmpeg failed?) — keeping current image", image); return 1; }
+    }
+    else
+    {
+      snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.jpg");
+      if(make_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
+      { use_image = proxypath; lg("srv", "preview proxy <- %s", image); }
+      else { lg("err", "cannot decode %s (unsupported/corrupt?) — keeping current image", image); return 1; }
+    }
   }
   else if(raw || vid)
   { // i-raw / i-vid need a resolvable path: pass absolute (modify_roi_out early-returns on
@@ -1472,11 +1522,23 @@ static int open_image(const char *image)
   param.output[1].colour_primaries = s_colour_primaries_srgb;
   param.output[1].colour_trc       = s_colour_trc_srgb;
 
-  char imgline[1280]; char *extra[1];
+  // extra[]: filename always; for the exr conversion path also declare the proxy's colour space
+  // explicitly (prim=srgb/rec709 primaries, trc=linear -- make_exr_proxy() already degammaed the
+  // pixels) instead of relying on i-exr's EXR-metadata-derived default (rec2020/linear), which
+  // would be wrong for an sRGB-primaries source (see PNG-zu-EXR plan §4).
+  char imgline[1280], primline[64], trcline[64]; char *extra[3]; int extra_cnt = 0;
   if(image)
   {
     snprintf(imgline, sizeof(imgline), "param:%s:main:filename:%s", inmod, use_image);
-    extra[0] = imgline; param.extra_param_cnt = 1; param.p_extra_param = extra;
+    extra[extra_cnt++] = imgline;
+    if(rasterconv)
+    {
+      snprintf(primline, sizeof(primline), "param:i-exr:main:prim:%d", s_colour_primaries_srgb);
+      snprintf(trcline,  sizeof(trcline),  "param:i-exr:main:trc:%d",  s_colour_trc_linear);
+      extra[extra_cnt++] = primline;
+      extra[extra_cnt++] = trcline;
+    }
+    param.extra_param_cnt = extra_cnt; param.p_extra_param = extra;
   }
   if(dt_graph_export(&g_graph, &param) != VK_SUCCESS)
   { lg("err", "graph export failed for '%s'", cfg); return 1; }
