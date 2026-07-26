@@ -1233,20 +1233,29 @@ static int make_proxy(const char *in, const char *out, int maxdim)
 
 // convert `in` (png/webp/tiff/bmp, see is_exr_convertible_path()) to a scene-linear EXR proxy
 // `out`, capped to maxdim on the long side (same CPU-side cap make_proxy() applies via
-// g_conf.proxy_max). Runs ffmpeg via popen(), the same subprocess pattern export_video() above
-// uses for its h265 pipe -- ffmpeg is already a runtime dependency of this server, no new tool.
+// g_conf.proxy_max) -- WITHOUT upscaling smaller sources: `scale=w='min(iw,maxdim)':h='min(ih,maxdim)'`
+// only shrinks a dimension that actually exceeds maxdim (force_original_aspect_ratio=decrease alone
+// is not enough: given a fixed maxdim x maxdim target box it happily upscales a small source, e.g. a
+// 64x64 test patch coming out at 1600x1600 -- caught live while phone-validating this feature).
+// Runs ffmpeg via popen(), the same subprocess pattern export_video() above uses for its h265 pipe --
+// ffmpeg is already a runtime dependency of this server, no new tool.
 // The zscale filter degammas sRGB -> linear before the float EXR is written: PNG-zu-EXR plan §4
 // measured this empirically (a 128,128,128 sRGB patch round-trips to 0.500 linear WITHOUT this
 // filter -- wrong, plain integer/255 rescale -- vs. 0.216 WITH it -- correct sRGB EOTF, matches
 // vkdt's expectation of scene-linear input). `prim`/`trc` on the i-exr module (set via open_image()'s
 // extra_param, not here) tell vkdt the data is already linear sRGB/rec709 primaries, since ffmpeg's
 // exr encoder writes no chromaticities/trc custom attributes for i-exr's header parser to pick up.
+// `setsar=1` is NOT cosmetic: ffmpeg's exr encoder only writes the (per the OpenEXR spec, mandatory)
+// "pixelAspectRatio" header attribute when the frame carries an explicit sample aspect ratio -- without
+// it, tinyexr (i-exr's vendored, unmodified decoder) hard-rejects the file ("could not load file") and
+// the render silently falls back to a black/uninitialised buffer (found live: gallery_open reported
+// success, but the phone showed pure black -- this is what caught it, see PNG-zu-EXR plan follow-up).
 static int make_exr_proxy(const char *in, const char *out, int maxdim)
 {
   char cmd[2048];
   snprintf(cmd, sizeof(cmd),
-      "ffmpeg -y -i \"%s\" -vf \"scale=%d:%d:force_original_aspect_ratio=decrease,"
-      "zscale=transferin=iec61966-2-1:transfer=linear\" -pix_fmt gbrpf32le -update 1 \"%s\" "
+      "ffmpeg -y -i \"%s\" -vf \"scale=w='min(iw\\,%d)':h='min(ih\\,%d)':force_original_aspect_ratio=decrease,"
+      "zscale=transferin=iec61966-2-1:transfer=linear,setsar=1\" -pix_fmt gbrpf32le -update 1 \"%s\" "
       "2>/dev/null", in, maxdim, maxdim, out);
   FILE *fp = popen(cmd, "r");
   if(!fp) return 1;
