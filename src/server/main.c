@@ -1250,13 +1250,52 @@ static int make_proxy(const char *in, const char *out, int maxdim)
 // it, tinyexr (i-exr's vendored, unmodified decoder) hard-rejects the file ("could not load file") and
 // the render silently falls back to a black/uninitialised buffer (found live: gallery_open reported
 // success, but the phone showed pure black -- this is what caught it, see PNG-zu-EXR plan follow-up).
+// Security: `in` ultimately derives from a client-supplied gallery path, which can carry an
+// upload-created filename -- file_server.py's _safe_basename() deliberately allows any character
+// except path separators/leading dots (by design, to not reject legitimate Unicode names), so it
+// does NOT rule out shell metacharacters like `"`, `` ` ``, `$`, `;`. Interpolating `in`/`out`
+// into the ffmpeg command string via a naive "%s"-quote (as the first version of this function
+// did) would let a crafted upload filename (e.g. `x"; touch /tmp/pwned; echo ".png`) break out of
+// the double-quoted argument and inject arbitrary shell commands via popen()'s /bin/sh -- a
+// materially worse risk class than this project's existing LAN-trust model (file ops via direct
+// syscalls, never a shell). shell_quote() below wraps each path in POSIX single-quotes (immune to
+// $/`/\ expansion) and escapes any embedded single quote as '\'' (close-quote, literal escaped
+// quote, reopen-quote) -- the standard technique for safely embedding an arbitrary byte string as
+// a single shell word.
+static int shell_quote(const char *in, char *out, size_t outsz)
+{
+  size_t o = 0;
+  if(o + 1 >= outsz) return -1;
+  out[o++] = '\'';
+  for(const char *p = in; *p; p++)
+  {
+    if(*p == '\'')
+    {
+      if(o + 4 >= outsz) return -1;
+      out[o++] = '\''; out[o++] = '\\'; out[o++] = '\''; out[o++] = '\'';
+    }
+    else
+    {
+      if(o + 1 >= outsz) return -1;
+      out[o++] = *p;
+    }
+  }
+  if(o + 2 >= outsz) return -1;
+  out[o++] = '\'';
+  out[o] = 0;
+  return 0;
+}
+
 static int make_exr_proxy(const char *in, const char *out, int maxdim)
 {
-  char cmd[2048];
+  char qin[2048], qout[2048];
+  if(shell_quote(in, qin, sizeof(qin)) != 0 || shell_quote(out, qout, sizeof(qout)) != 0)
+  { lg("err", "make_exr_proxy: path too long to quote safely"); return 1; }
+  char cmd[4096];
   snprintf(cmd, sizeof(cmd),
-      "ffmpeg -y -i \"%s\" -vf \"scale=w='min(iw\\,%d)':h='min(ih\\,%d)':force_original_aspect_ratio=decrease,"
-      "zscale=transferin=iec61966-2-1:transfer=linear,setsar=1\" -pix_fmt gbrpf32le -update 1 \"%s\" "
-      "2>/dev/null", in, maxdim, maxdim, out);
+      "ffmpeg -y -i %s -vf \"scale=w='min(iw\\,%d)':h='min(ih\\,%d)':force_original_aspect_ratio=decrease,"
+      "zscale=transferin=iec61966-2-1:transfer=linear,setsar=1\" -pix_fmt gbrpf32le -update 1 %s "
+      "2>/dev/null", qin, maxdim, maxdim, qout);
   FILE *fp = popen(cmd, "r");
   if(!fp) return 1;
   int ret = pclose(fp);
