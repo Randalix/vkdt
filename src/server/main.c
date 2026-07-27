@@ -1481,7 +1481,19 @@ static int open_image(const char *image)
   {
     if(rasterconv)
     {
-      snprintf(proxypath, sizeof(proxypath), "rabbit_proxy.exr");
+      // i-exr resolves its own "filename" param via dt_graph_get_resource_filename(), which --
+      // unlike i-jpg's dt_graph_open_resource() (searchpath, then homedir, then basedir fallback)
+      // -- has no fallback chain: a relative name is tried ONLY against graph->searchpath, which
+      // dt_graph_read_config_ascii() sets to the *cfg file's own directory* (here: "examples/",
+      // since cfg_exr lives in examples/m3_exr.cfg) -- not the server's cwd (bin/), where this
+      // proxy actually gets written. A bare "rabbit_proxy.exr" therefore silently fails to resolve:
+      // read_header() returns 1, modify_roi_out() falls back to a 32x32 dummy buffer, and the
+      // whole export still reports success -- rendering pure black with no error anywhere (found
+      // during phone validation). Fix: write/reference an ABSOLUTE path, exactly like the existing
+      // raw/vid branch below already does with realpath() for the same class of problem.
+      char cwd[700];
+      if(!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+      snprintf(proxypath, sizeof(proxypath), "%s/rabbit_proxy.exr", cwd);
       if(make_exr_proxy(image, proxypath, g_conf.proxy_max) == 0 && access(proxypath, R_OK) == 0)
       { use_image = proxypath; lg("srv", "exr preview proxy <- %s", image); }
       else { lg("err", "cannot convert %s to exr (ffmpeg failed?) — keeping current image", image); return 1; }
