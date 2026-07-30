@@ -43,8 +43,6 @@ widget_end()
   if(!vkdt.wstate.grabbed)
   {
     if(vkdt.wstate.active_widget_modid < 0) return; // all good already
-    // rerun all (roi could have changed, buttons are drastic)
-    vkdt.graph_dev.runflags = s_graph_run_all;
     int modid = vkdt.wstate.active_widget_modid;
     int parid = vkdt.wstate.active_widget_parid;
     int parnm = vkdt.wstate.active_widget_parnm;
@@ -911,6 +909,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         dt_module_set_param_float(vkdt.graph_dev.module+modid, dt_token("rotate"), vkdt.wstate.state[9]);
         dt_module_set_param_float_n(vkdt.graph_dev.module+modid, dt_token("crop"), vkdt.wstate.state+10, 4);
         widget_end();
+        vkdt.graph_dev.runflags = s_graph_run_all;
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
       }
       nk_style_pop_style_item(ctx);
@@ -1024,7 +1023,6 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
     const float aspect = iwd/iht;
     const float rot = dt_module_param_float(vkdt.graph_dev.module+modid, dt_module_get_param(vkdt.graph_dev.module[modid].so, dt_token("rotate")))[0];
     const int portrait = (fabsf(rot-90) < 45 || fabsf(rot-270) < 45);
-    static int portrait_on_activate;
     if(vkdt.wstate.active_widget_modid == modid && vkdt.wstate.active_widget_parid == parid)
     {
       int accept = 0;
@@ -1033,7 +1031,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
       nk_style_push_color(ctx, &ctx->style.button.text_normal, vkdt.style.colour[NK_COLOR_DT_ACCENT_TEXT]);
       if(nk_button_label(ctx, string) || accept)
       {
-        if(portrait_on_activate)
+        if(vkdt.wstate.portrait)
         {
           vkdt.wstate.state[0] = .5f + MIN(1.0f, 1.0f/aspect) * (vkdt.wstate.state[0] - .5f);
           vkdt.wstate.state[1] = .5f + MIN(1.0f, 1.0f/aspect) * (vkdt.wstate.state[1] - .5f);
@@ -1041,6 +1039,7 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
           vkdt.wstate.state[3] = .5f + MAX(1.0f,      aspect) * (vkdt.wstate.state[3] - .5f);
         }
         widget_end();
+        vkdt.graph_dev.runflags = s_graph_run_all;
         dt_image_reset_zoom(&vkdt.wstate.img_widget);
         dt_graph_history_append(&vkdt.graph_dev, modid, parid, throttle);
       }
@@ -1071,9 +1070,9 @@ render_darkroom_widget(int modid, int parid, int is_fav_menu)
         const float oht = portrait ? iwd : iht;
         // reset module params so the image will not appear cropped:
         float def[] = {0,1,0,1};
+        vkdt.wstate.portrait = portrait;
         if(portrait)
         {
-          portrait_on_activate = portrait;
           def[0] = .5f + MIN(1.0f, 1.0f/aspect) * (0.0f - .5f);
           def[1] = .5f + MIN(1.0f, 1.0f/aspect) * (1.0f - .5f);
           def[2] = .5f + MAX(1.0f,      aspect) * (0.0f - .5f);

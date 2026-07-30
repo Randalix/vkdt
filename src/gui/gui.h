@@ -42,6 +42,8 @@ typedef struct dt_gui_style_t
   float panel_width_frac;   // width of the side panel as fraction of the total window width
   float border_frac;        // width of border between image and panel
   float fontsize;           // font height in pixels
+  float color_assessment_margin;   // color assessment margin
+  float color_assessment_frame_wd; // color assessment frame width
   struct nk_color colour[NK_COLOR_COUNT+7];
 }
 dt_gui_style_t;
@@ -87,6 +89,7 @@ typedef struct dt_gui_wstate_t
   struct nk_rect active_dspy_bound;
   int      selected;
   float    aspect;
+  int      portrait;
   float    state[2100];
   size_t   mapped_size;
   float   *mapped;
@@ -109,6 +112,7 @@ typedef struct dt_gui_wstate_t
   int fullscreen_view;          // darkroom mode without panels
   int history_view;             // darkroom mode with left panel shown (history view)
   float dopesheet_view;         // darkroom mode dopesheet, stores adaptive size (0 means collapsed)
+  int color_assessment;         // color assessment mode active
 
   int have_joystick;            // found and enabled a joystick (disable via gui/disable_joystick in config)
   int joystick_id;              // like GLFW_JOYSTICK_1
@@ -135,6 +139,8 @@ typedef struct dt_gui_wstate_t
   int   pending_widget_parid;   // param index for pending widget start
 
   int lighttable_images_per_row;// how many images per row in lighttable mode
+
+  double delta_time;            // time passed since last frame in seconds
 }
 dt_gui_wstate_t;
 
@@ -248,6 +254,7 @@ int  dt_gui_write_favs(const char *filename); // serialise the file with potenti
 void dt_gui_add_fav   (dt_token_t modid, dt_token_t insid, dt_token_t parid);
 void dt_gui_move_fav  (dt_token_t modid, dt_token_t insid, dt_token_t parid, int up);
 void dt_gui_remove_fav(dt_token_t modid, dt_token_t insid, dt_token_t parid);
+void dt_gui_rebuild_fav();
 
 // read list of tags (i.e. the directories in ~/.config/vkdt/tags/)
 void dt_gui_read_tags();

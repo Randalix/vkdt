@@ -1,21 +1,21 @@
 #include "modules/api.h"
 #include "denox_gbyrc.h"
+#include "denox_ibyrc.h"
 #include "denox_nbyrc.h"
 #include "denox_gxtrc.h"
+#include "denox_ixtrc.h"
 #include "denox_nxtrc.h"
 #include "denox_gbyrn.h"
+#include "denox_ibyrn.h"
 #include "denox_nbyrn.h"
 #include "denox_gxtrn.h"
+#include "denox_ixtrn.h"
 #include "denox_nxtrn.h"
 
-// intel and amd yet unknown:
-// #include "denox_ibyrc.h"
+// amd yet unknown:
 // #include "denox_abyrc.h"
-// #include "denox_ixtrc.h"
 // #include "denox_axtrc.h"
-// #include "denox_ibyrn.h"
 // #include "denox_abyrn.h"
-// #include "denox_ixtrn.h"
 // #include "denox_axtrn.h"
 
 typedef enum arch_t
@@ -121,8 +121,8 @@ check_params(
 {
   const int pida = dt_module_get_param(mod->so, dt_token("arch"));
   const int pidv = dt_module_get_param(mod->so, dt_token("variant"));
-  const int vala = CLAMP(dt_module_param_int(mod, pida)[0], 0, 1);
-  const int valv = CLAMP(dt_module_param_int(mod, pidv)[0], 0, 1);
+  const int vala = dt_module_param_int(mod, pida)[0];
+  const int valv = dt_module_param_int(mod, pidv)[0];
   if(parid == pida) // arch changed
     if(*(int*)oldval != vala) 
       return s_graph_run_all;
@@ -139,16 +139,16 @@ int read_source(dt_module_t *mod, void *mapped, dt_read_source_params_t *p)
   {
     case s_arch_gbyc: return denox_read_source_gbyrc(mod, mapped, p);
     case s_arch_gbyn: return denox_read_source_gbyrn(mod, mapped, p);
-    // case s_arch_ibyc: return denox_read_source_ibyrc(mod, mapped, p);
-    // case s_arch_ibyn: return denox_read_source_ibyrn(mod, mapped, p);
+    case s_arch_ibyc: return denox_read_source_ibyrc(mod, mapped, p);
+    case s_arch_ibyn: return denox_read_source_ibyrn(mod, mapped, p);
     // case s_arch_abyc: return denox_read_source_abyrc(mod, mapped, p);
     // case s_arch_abyn: return denox_read_source_abyrn(mod, mapped, p);
     case s_arch_nbyc: return denox_read_source_nbyrc(mod, mapped, p);
     case s_arch_nbyn: return denox_read_source_nbyrn(mod, mapped, p);
     case s_arch_gxtc: return denox_read_source_gxtrc(mod, mapped, p);
     case s_arch_gxtn: return denox_read_source_gxtrn(mod, mapped, p);
-    // case s_arch_ixtc: return denox_read_source_ixtrc(mod, mapped, p);
-    // case s_arch_ixtn: return denox_read_source_ixtrn(mod, mapped, p);
+    case s_arch_ixtc: return denox_read_source_ixtrc(mod, mapped, p);
+    case s_arch_ixtn: return denox_read_source_ixtrn(mod, mapped, p);
     // case s_arch_axtc: return denox_read_source_axtrc(mod, mapped, p);
     // case s_arch_axtn: return denox_read_source_axtrn(mod, mapped, p);
     case s_arch_nxtc: return denox_read_source_nxtrc(mod, mapped, p);
@@ -215,10 +215,10 @@ void create_nodes(dt_graph_t *graph, dt_module_t *module)
     case s_arch_gbyn:
       denox_create_nodes_gbyrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
       break;
-    // case s_arch_ibyc:
-    // case s_arch_ibyn:
-    //   denox_create_nodes_ibyrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
-    //   break;
+    case s_arch_ibyc:
+    case s_arch_ibyn:
+      denox_create_nodes_ibyrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
+      break;
     // case s_arch_abyc:
     // case s_arch_abyn:
     //   denox_create_nodes_abyrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
@@ -231,10 +231,10 @@ void create_nodes(dt_graph_t *graph, dt_module_t *module)
     case s_arch_gxtn:
       denox_create_nodes_gxtrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
       break;
-    // case s_arch_ixtc:
-    // case s_arch_ixtn:
-    //   denox_create_nodes_ixtrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
-    //   break;
+    case s_arch_ixtc:
+    case s_arch_ixtn:
+      denox_create_nodes_ixtrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
+      break;
     // case s_arch_axtc:
     // case s_arch_axtn:
     //   denox_create_nodes_axtrc(graph, module, (input_roi.ht+1)/2, (input_roi.wd+1)/2, input, "output", output, "input");
