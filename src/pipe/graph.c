@@ -235,6 +235,7 @@ dt_graph_cleanup(dt_graph_t *g)
   graph_destroy_per_image_resources(g);
   for(int i=0;i<g->memory_cnt;i++)
     vkFreeMemory(qvk.device, g->memory[i].vkmem, 0);
+  g->memory_cnt = 0;
   vkDestroyDescriptorPool(qvk.device, g->dset_pool, 0);
   vkDestroyDescriptorSetLayout(qvk.device, g->uniform_dset_layout, 0);
   vkDestroyBuffer(qvk.device, g->uniform_buffer, 0);
