@@ -59,9 +59,9 @@ include server/flat.mk
 include tools/flat.mk
 
 clean: Makefile
-	rm -f ../bin/vkdt ../bin/vkdt-cli ../bin/vkdt-fit ../bin/vkdt-read-icc ../bin/vkdt-eval-profile ../bin/vkdt-lutinfo
+	rm -f ../bin/vkdt ../bin/vkdt-cli ../bin/vkdt-fit ../bin/vkdt-server ../bin/vkdt-read-icc ../bin/vkdt-eval-profile ../bin/vkdt-lutinfo
 	rm -f ../bin/vkdt-mkclut ../bin/vkdt-mkssf
-	rm -f $(GUI_O) $(CORE_O) $(PIPE_O) $(SND_O) $(CLI_O) $(FIT_O) $(QVK_O) $(DB_O)
+	rm -f $(GUI_O) $(CORE_O) $(PIPE_O) $(SND_O) $(CLI_O) $(FIT_O) $(QVK_O) $(DB_O) $(SERVER_O) $(SERVER_CIV_O)
 	rm -f gui/shd.h
 	rm -f gui/shd/*.spv
 	# we delete *all* modules, not just the one in MOD_DSOS* because they may be from another branch.

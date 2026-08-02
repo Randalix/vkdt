@@ -1,6 +1,6 @@
 SERVER_O=server/main.o
 SERVER_CIV_O=server/civetweb/civetweb.o
-SERVER_H=
+SERVER_H=$(PIPE_H) $(CORE_H) $(QVK_H) server/cfg_rewire.h
 SERVER_CFLAGS=-Iserver/civetweb $(VKDT_JPEG_CFLAGS)
 SERVER_LDFLAGS=$(DYNAMIC) -lm -lpthread $(VKDT_JPEG_LDFLAGS)
 # civetweb: minimal feature set, no TLS (Tailscale Serve terminates), websockets on
