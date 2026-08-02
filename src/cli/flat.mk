@@ -1,4 +1,4 @@
 CLI_O=cli/main.o
-CLI_H=
+CLI_H=$(PIPE_H) $(CORE_H) $(QVK_H)
 CLI_CFLAGS=
 CLI_LDFLAGS=$(DYNAMIC) -lm
